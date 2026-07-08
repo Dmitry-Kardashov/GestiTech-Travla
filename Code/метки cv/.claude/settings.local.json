@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 metki.py image1.png --out /tmp/a.png)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
