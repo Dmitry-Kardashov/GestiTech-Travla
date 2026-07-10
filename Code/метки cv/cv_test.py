@@ -68,8 +68,8 @@ def main():
 
         disp = cv2.resize(frame, (DISPLAY_WIDTH, disp_h), interpolation=cv2.INTER_AREA)
         hud = ("AF" if autofocus else f"MF {focus}") + (" | undist" if undist else "")
-        cv2.putText(disp, f"{aw}x{ah}  {hud}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # cv2.putText(disp, f"{aw}x{ah}  {hud}", (20, 40),
+                    # cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         if process:                              # живой поиск меток на кадре превью
             markers, found_thick = detect(disp)
             disp = draw_debug(disp, markers, found_thick)

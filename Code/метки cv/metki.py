@@ -40,6 +40,7 @@ find_fiducials.py
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass, asdict
 
@@ -115,6 +116,17 @@ def find_ring_markers(
             continue
         # Отверстие настоящей метки — круглое. У BGA-сетки/квадрата — нет.
         if circularity(hole) < min_circularity - 0.05:
+            continue
+
+        # Внутри отверстия настоящей метки максимум одна точка. У BGA-сетки
+        # там 9 «шариков» — считаем значимых потомков и отбрасываем «сетки».
+        n_children = 0
+        ch = hierarchy[hole_idx][2]
+        while ch != -1:
+            if cv2.contourArea(contours[ch]) >= 3:
+                n_children += 1
+            ch = hierarchy[ch][0]
+        if n_children > 2:
             continue
 
         (ox, oy), outer_r = cv2.minEnclosingCircle(c)
@@ -245,24 +257,63 @@ def undistort(img_bgr: np.ndarray, mtx, dist) -> np.ndarray:
     return cv2.undistort(img_bgr, mtx, dist, None, new_mtx)
 
 
-def detect(img_bgr: np.ndarray, *, adaptive: bool = False, blur: int = 0,
-           min_circularity: float = 0.85, edge_frac: float = 0.22,
-           min_gap_ratio: float = 0.3) -> tuple[list[Marker], bool]:
+def _bw_variants(gray: np.ndarray) -> list[np.ndarray]:
     """
-    Полный конвейер поиска реперов на BGR-кадре (из файла или с камеры):
-    бинаризация -> поиск колец+точек -> дедуп -> отбор по периметру/размеру
-    -> разметка зон -> авто-деление тонкая/толстая. Возвращает (метки, есть_толстые).
+    Набор бинаризаций для авто-режима. Рендеры gerber отлично берёт Otsu, а
+    реальные фото (неровный свет, зелёная маска, просвет на просвет) —
+    адаптивный порог. Обе полярности: у платы на просвет кольцо ТЁМНОЕ на
+    светлом фоне, у обычного фото — СВЕТЛАЯ медь. Одна из версий подойдёт.
+    """
+    # CLAHE вытягивает контраст на «слабых» фото (медь на зелёной маске).
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    variants = []
+    for g in (gray, clahe.apply(gray)):
+        _, o = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(o)
+        gb = cv2.GaussianBlur(g, (3, 3), 0)
+        for bs, c in ((35, -5), (51, 5), (75, 8)):
+            variants.append(cv2.adaptiveThreshold(
+                gb, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, c))
+    return [b for v in variants for b in (v, 255 - v)]  # + инвертированные
+
+
+def _score(markers: list[Marker]) -> tuple:
+    """Больше меток -> лучше; при равенстве -> плотнее кластер по размеру."""
+    if not markers:
+        return (0, 0.0)
+    rs = np.array([m.outer_r for m in markers])
+    cv_ = float(np.std(rs) / (np.mean(rs) + 1e-9))
+    return (len(markers), -cv_)
+
+
+def detect(img_bgr: np.ndarray, *, min_circularity: float = 0.86,
+           edge_frac: float = 0.22, min_gap_ratio: float = 0.3,
+           auto: bool = True, adaptive: bool = False, blur: int = 0
+           ) -> tuple[list[Marker], bool]:
+    """
+    Полный конвейер поиска реперов на BGR-кадре (из файла или с камеры). В
+    авто-режиме перебирает несколько бинаризаций и полярностей и берёт
+    лучший результат — поэтому одинаково работает и на рендерах gerber, и
+    на реальных фото без ручной настройки. Возвращает (метки, есть_толстые).
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
-    bw = binarize(gray, blur, adaptive)
     ia = w * h
-    raw = dedup_markers(find_ring_markers(bw, ia * 0.00002, ia * 0.01, min_circularity))
-    markers = select_fiducials(raw, w, h, edge_frac)
-    label_corners(markers, w, h)
-    found_thick = auto_classify_dot_size(markers, min_gap_ratio)
-    markers.sort(key=lambda m: (m.y, m.x))
-    return markers, found_thick
+    variants = _bw_variants(gray) if auto else [binarize(gray, blur, adaptive)]
+
+    best: list[Marker] = []
+    best_key = (-1, 0.0)
+    for bw in variants:
+        raw = dedup_markers(find_ring_markers(bw, ia * 0.00002, ia * 0.01, min_circularity))
+        ms = select_fiducials(raw, w, h, edge_frac)
+        key = _score(ms)
+        if key > best_key:
+            best_key, best = key, ms
+
+    label_corners(best, w, h)
+    found_thick = auto_classify_dot_size(best, min_gap_ratio)
+    best.sort(key=lambda m: (m.y, m.x))
+    return best, found_thick
 
 
 def draw_debug(img_bgr: np.ndarray, markers: list[Marker], found_thick: bool) -> np.ndarray:
@@ -297,79 +348,63 @@ def draw_debug(img_bgr: np.ndarray, markers: list[Marker], found_thick: bool) ->
     return out
 
 
+CALIB_DEFAULT = "camera_calibration.npz"   # калибровка для снимков с камеры
+
+
+def report(markers: list[Marker], found_thick: bool) -> None:
+    """Печатает найденные метки в консоль."""
+    print(f"\nНайдено меток: {len(markers)}")
+    print(f"{'x':>8} {'y':>8} {'outer_r':>8} {'dot/outer':>10} {'зона':>14} {'тип':>8}")
+    for m in markers:
+        ratio_txt = f"{m.dot_ratio:.3f}" if m.dot_ratio is not None else "n/a"
+        print(f"{m.x:8.1f} {m.y:8.1f} {m.outer_r:8.2f} {ratio_txt:>10} "
+              f"{m.corner:>14} {'ТОЛСТАЯ' if m.is_thick_dot else 'тонкая':>8}")
+    thick = sum(m.is_thick_dot for m in markers)
+    print(f"Тонких: {len(markers) - thick}, толстых: {thick}")
+
+
+def run_file(path: str, out: str, save_json: str | None, calib: str | None = None) -> None:
+    """Считать изображение платы из файла и найти метки. Для снимков с камеры
+    (calib задан) сначала убирается дисторсия объектива."""
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        sys.exit(f"Не удалось прочитать изображение: {path}")
+    if calib:
+        try:
+            img = undistort(img, *load_calibration(calib))
+            print(f"Калибровка применена: {calib}")
+        except Exception as e:
+            print(f"Калибровка не применена ({e}).")
+    markers, found_thick = detect(img)
+    if not markers:
+        sys.exit("Метки не найдены.")
+    report(markers, found_thick)
+    cv2.imwrite(out, draw_debug(img, markers, found_thick))
+    print(f"Размеченное изображение сохранено: {out}")
+    if save_json:
+        with open(save_json, "w", encoding="utf-8") as f:
+            json.dump([asdict(m) for m in markers], f, ensure_ascii=False, indent=2)
+        print(f"JSON сохранён: {save_json}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Поиск реперных меток 'кольцо+точка' на плате, "
-                                             "классификация по размеру точки")
-    ap.add_argument("image", help="Путь к изображению платы")
-    ap.add_argument("--adaptive", action="store_true",
-                    help="Адаптивная бинаризация (рекомендуется для реальных фото)")
-    ap.add_argument("--blur", type=int, default=0,
-                    help="Размер ядра размытия перед бинаризацией (например, 3 или 5)")
-    ap.add_argument("--min-gap-ratio", type=float, default=0.3,
-                    help="Чувствительность авто-деления тонкая/толстая: самый большой "
-                         "разрыв между отсортированными dot_r/outer_r должен быть не меньше "
-                         "этой доли от полного разброса (по умолчанию 0.3). Меньше (0.15) — "
-                         "ловит более тонкие различия.")
-    ap.add_argument("--min-circularity", type=float, default=0.85,
-                    help="Минимальная круглость кольца и отверстия (0..1). Выше — строже "
-                         "отсекаются квадратные BGA-сетки и шелкография.")
-    ap.add_argument("--edge-frac", type=float, default=0.22,
-                    help="Ширина краевой полосы (доля стороны), в которой ищутся реперы. "
-                         "Метки в центре платы (тест-полигон) отбрасываются.")
-    ap.add_argument("--undistort", default=None,
-                    help="Путь к .npz с калибровкой камеры (mtx, dist) — убрать дисторсию")
+    ap = argparse.ArgumentParser(
+        description="Поиск реперных меток 'кольцо+точка' на плате. "
+                    "Выберите сценарий (file/camera) и изображение — остальное автоматически.")
+    ap.add_argument("mode", choices=["file", "camera"],
+                    help="file — рендер платы (gerber); camera — фото с камеры (снимается дисторсия)")
+    ap.add_argument("image", help="путь к изображению платы")
     ap.add_argument("--out", default="fiducials_annotated.png",
-                    help="Куда сохранить размеченное изображение")
-    ap.add_argument("--json", default=None,
-                    help="Опционально: сохранить найденные метки в JSON")
+                    help="куда сохранить размеченное изображение")
+    ap.add_argument("--json", default=None, help="сохранить координаты меток в JSON")
+    ap.add_argument("--calib", default=CALIB_DEFAULT,
+                    help="файл калибровки камеры .npz (сценарий camera)")
     args = ap.parse_args()
 
-    img_bgr = cv2.imread(args.image, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        sys.exit(f"Не удалось прочитать изображение: {args.image}")
-
-    if args.undistort:
-        mtx, dist = load_calibration(args.undistort)
-        img_bgr = undistort(img_bgr, mtx, dist)
-
-    markers, found_thick = detect(
-        img_bgr, adaptive=args.adaptive, blur=args.blur,
-        min_circularity=args.min_circularity, edge_frac=args.edge_frac,
-        min_gap_ratio=args.min_gap_ratio,
-    )
-
-    if not markers:
-        print("Метки не найдены. Попробуйте --adaptive, --blur 3, "
-              "уменьшить --min-circularity (например, 0.8) "
-              "или увеличить --edge-frac.")
-        sys.exit(1)
-
-    print(f"Найдено меток: {len(markers)}\n")
-    print(f"{'x':>8} {'y':>8} {'outer_r':>8} {'dot_r':>8} {'dot/outer':>10} {'зона':>14} {'толстая?':>10}")
-    for m in markers:
-        dot_r_txt = f"{m.dot_r:.2f}" if m.dot_r is not None else "n/a"
-        ratio_txt = f"{m.dot_ratio:.3f}" if m.dot_ratio is not None else "n/a"
-        print(f"{m.x:8.1f} {m.y:8.1f} {m.outer_r:8.2f} {dot_r_txt:>8} "
-              f"{ratio_txt:>10} {m.corner:>14} {'YES' if m.is_thick_dot else '':>10}")
-
-    thick = [m for m in markers if m.is_thick_dot]
-    if found_thick and thick:
-        print(f"\nАвтоматически найдена группа меток с увеличенной точкой: {len(thick)} шт.")
-        for m in thick:
-            print(f"  -> ({m.x:.1f}, {m.y:.1f}) в зоне '{m.corner}', "
-                  f"dot_r={m.dot_r:.2f}, dot/outer={m.dot_ratio:.3f}")
-    else:
-        print("\nВторой явной группы по размеру точки не найдено — все метки похожи. "
-              "Если разница всё же должна быть, уменьшите --min-gap-ratio (например, 0.15).")
-
-    debug_img = draw_debug(img_bgr, markers, found_thick)
-    cv2.imwrite(args.out, debug_img)
-    print(f"\nРазмеченное изображение сохранено: {args.out}")
-
-    if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump([asdict(m) for m in markers], f, ensure_ascii=False, indent=2)
-        print(f"JSON с координатами сохранён: {args.json}")
+    calib = None
+    if args.mode == "camera":
+        calib = args.calib if (args.calib and os.path.exists(args.calib)) else None
+    run_file(args.image, args.out, args.json, calib)
 
 
 if __name__ == "__main__":
