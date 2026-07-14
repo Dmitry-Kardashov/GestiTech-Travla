@@ -6,8 +6,8 @@ import os
 # ⚙️ БЛОК НАСТРОЕК
 # ==========================================
 INPUT_GERBER = 'GERBER.png'
-INPUT_PCB = 'PCB.jpg'
-# INPUT_PCB = 'PCB7.png'
+# INPUT_PCB = 'PCB.jpg'
+INPUT_PCB = 'PCB6.png'
 OUTPUT_DIR_ROOT = 'debugging_inspection'
 
 def align_images_orb(img_gerber, img_pcb):
@@ -118,7 +118,7 @@ def inspect_pcb(gerber_path, pcb_path, output_dir):
     excess_copper = cv2.morphologyEx(excess_copper, cv2.MORPH_OPEN, kernel_clean)
 
     output_visual = img_pcb_aligned.copy()
-    MIN_DEFECT_AREA = 50  # Фильтр пиксельной грязи (игнорируем все что меньше 50 пикселей)
+    MIN_DEFECT_AREA = 120  # Фильтр пиксельной грязи (игнорируем все что меньше 50 пикселей)
 
     # Отрисовка ОБРЫВОВ (Красные рамки)
     contours_missing, _ = cv2.findContours(missing_copper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
