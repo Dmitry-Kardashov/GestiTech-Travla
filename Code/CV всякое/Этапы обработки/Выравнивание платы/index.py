@@ -124,7 +124,7 @@ def align_pcb_smart(image_path):
 
 if __name__ == "__main__":
     # Вы можете передать сюда как фото на столе (PCB6.jpg), так и готовый скан — код сам решит, что делать!
-    result = align_pcb_smart("PCB.jpg")
+    result = align_pcb_smart("PCB_RESIST.jpg")
     
     if result is not None:
         cv2.imwrite("aligned_pcb.jpg", result)
