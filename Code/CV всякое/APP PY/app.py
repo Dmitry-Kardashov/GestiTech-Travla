@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import os
-import json
 import gradio as gr
 
 # ==========================================
@@ -9,73 +8,6 @@ import gradio as gr
 # ==========================================
 OUTPUT_DIR_ROOT = 'debugging_inspection'
 os.makedirs(OUTPUT_DIR_ROOT, exist_ok=True)
-
-CONFIG_FILE = 'pcb_config.json'
-
-# Пресеты бинаризации по умолчанию
-PRESETS = {
-    "Стандартная плата": {
-        "filter_d": 9,
-        "sigma_color": 75,
-        "sigma_space": 75,
-        "block_size": 11,
-        "c_val": 2,
-        "noise_method": "Морфологическое открытие (Быстро)",
-        "morph_size": 4,
-        "min_noise_area": 250,
-        "min_defect_area": 120
-    },
-    "Плата с фоторезистом и медью": {
-        "filter_d": 15,            # Более сильное размытие для текстуры фоторезиста
-        "sigma_color": 120,
-        "sigma_space": 100,
-        "block_size": 25,          # Больший размер блока для компенсации разности освещения
-        "c_val": -5,               # Смещение в минус, чтобы лучше выделять сине-фиолетовый фоторезист
-        "noise_method": "Фильтрация по площади (Чисто)",
-        "morph_size": 5,
-        "min_noise_area": 350,     # Повышенный порог шума
-        "min_defect_area": 150
-    }
-}
-
-def load_saved_config():
-    """Загружает сохраненные параметры из файла, если он существует."""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Ошибка чтения конфигурации: {e}")
-    return PRESETS["Стандартная плата"]
-
-def save_current_config(*args):
-    """Сохраняет текущие параметры интерфейса в файл."""
-    keys = [
-        "filter_d", "sigma_color", "sigma_space", 
-        "block_size", "c_val", "noise_method", 
-        "morph_size", "min_noise_area", "min_defect_area"
-    ]
-    config = dict(zip(keys, args))
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
-        return "✅ Параметры успешно сохранены на сервере!"
-    except Exception as e:
-        return f"❌ Ошибка сохранения параметров: {str(e)}"
-
-def apply_preset(preset_name):
-    """Применяет параметры выбранного пресета к слайдерам."""
-    p = PRESETS.get(preset_name, PRESETS["Стандартная плата"])
-    return (
-        p["filter_d"], p["sigma_color"], p["sigma_space"],
-        p["block_size"], p["c_val"], p["noise_method"],
-        p["morph_size"], p["min_noise_area"], p["min_defect_area"]
-    )
-
-
-# ==========================================
-# 🛠️ ФУНКЦИИ ОБРАБОТКИ
-# ==========================================
 
 def _order_corners(pts):
     pts = pts.reshape(4, 2).astype(np.float32)
@@ -221,255 +153,113 @@ def remove_noise_by_contours(binary_img, min_area):
     return clean_mask
 
 
-def binarize_pcb_advanced(img_aligned, filter_d, sigma_color, sigma_space, block_size, c_val, noise_method, morph_size, min_noise_area):
-    # Канал «медность»: медь сильнее отражает красный, подложка — зелёный.
-    # По нему медь и тонких дорожек, и сплошных площадок имеет один уровень.
+
+def binarize_pcb_raw(img_aligned, block_size, c_val):
+    """ Шаг 2: Адаптивная бинаризация по цветовому каналу """
     b, g, r = cv2.split(img_aligned)
     diff = cv2.subtract(r, g)
     diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
-    filtered = cv2.bilateralFilter(
-        src=diff, d=int(filter_d), sigmaColor=sigma_color, sigmaSpace=sigma_space
+    
+    if block_size % 2 == 0:
+        block_size += 1
+    if block_size < 3:
+        block_size = 3
+
+    thresh_raw = cv2.adaptiveThreshold(
+        diff, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, block_size, c_val
     )
+    return thresh_raw
 
-    # Глобальный порог (Otsu) закрашивает сплошные области меди ЦЕЛИКОМ,
-    # в отличие от адаптивного порога, который оставлял только контур.
-    otsu_val, _ = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # c_val — ручная подстройка чувствительности (сдвиг порога).
-    thr = int(np.clip(otsu_val - c_val, 0, 255))
-    _, binary = cv2.threshold(filtered, thr, 255, cv2.THRESH_BINARY)
+def clean_pcb_mask(thresh_raw):
+    """ Шаг 3: Морфологическое удаление шума """
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thresh_clean = cv2.morphologyEx(thresh_raw, cv2.MORPH_OPEN, kernel)
+    thresh_clean = cv2.morphologyEx(thresh_clean, cv2.MORPH_CLOSE, kernel)
+    return thresh_clean
 
-    # Закрываем мелкие разрывы внутри залитых площадок.
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    )
+def process_pcb_pipeline(pcb_img, block_size, c_val):
+    if pcb_img is None:
+        return None, None, None, "Пожалуйста, загрузите изображение платы."
 
-    cleaned = binary.copy()
-    if noise_method == "Морфологическое открытие (Быстро)":
-        if morph_size > 0:
-            kernel = cv2.getStructuringElement(
-                cv2.MORPH_RECT, (int(morph_size), int(morph_size))
-            )
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-    elif noise_method == "Фильтрация по площади (Чисто)":
-        cleaned = remove_noise_by_contours(cleaned, min_noise_area)
-
-    return cleaned
-
-
-def inspect_pcb_interface(
-    gerber_img, pcb_img, 
-    filter_d, sigma_color, sigma_space, 
-    block_size, c_val, 
-    noise_method, morph_size, min_noise_area, 
-    min_defect_area
-):
-    if gerber_img is None or pcb_img is None:
-        return None, None, "Пожалуйста, загрузите оба изображения (Шаблон и Фото платы)."
-
-    img_gerber = cv2.cvtColor(gerber_img, cv2.COLOR_RGB2BGR)
     img_pcb = cv2.cvtColor(pcb_img, cv2.COLOR_RGB2BGR)
-
-    status_msg = "Статус: Начинаем обработку...\n"
+    status_msg = "--- Старт обработки ---\n"
     
     try:
-        # 1. Выравнивание
-        img_pcb_aligned = align_images_orb(img_gerber, img_pcb)
-        img_pcb_aligned = refine_registration_orb(img_gerber, img_pcb_aligned)
+        # --- ШАГ 1: ОБРЕЗКА И ВЫРАВНИВАНИЕ ---
+        img_pcb_aligned, align_status = align_and_crop_pcb(img_pcb)
         cv2.imwrite(os.path.join(OUTPUT_DIR_ROOT, 'step1_pcb_aligned.jpg'), img_pcb_aligned)
-        status_msg += "[1/3] Выравнивание слоев успешно завершено.\n"
+        status_msg += f"[Шаг 1]: {align_status}\n"
         
-        # 2. Бинаризация
-        gerber_gray = cv2.cvtColor(img_gerber, cv2.COLOR_BGR2GRAY)
-        _, gerber_bin = cv2.threshold(gerber_gray, 127, 255, cv2.THRESH_BINARY)
+        # --- ШАГ 2: БИНАРИЗАЦИЯ ---
+        pcb_bin_raw = binarize_pcb_raw(img_pcb_aligned, int(block_size), int(c_val))
+        cv2.imwrite(os.path.join(OUTPUT_DIR_ROOT, 'step2_pcb_binarized_raw.jpg'), pcb_bin_raw)
+        status_msg += "[Шаг 2]: Адаптивная бинаризация завершена.\n"
+
+        # --- ШАГ 3: ОЧИСТКА ---
+        pcb_bin_clean = clean_pcb_mask(pcb_bin_raw)
+        cv2.imwrite(os.path.join(OUTPUT_DIR_ROOT, 'step3_pcb_binarized_clean.jpg'), pcb_bin_clean)
+        status_msg += "[Шаг 3]: Фильтрация шумов завершена.\n"
+
+        aligned_rgb = cv2.cvtColor(img_pcb_aligned, cv2.COLOR_BGR2RGB)
+        bin_raw_rgb = cv2.cvtColor(pcb_bin_raw, cv2.COLOR_GRAY2RGB)
+        bin_clean_rgb = cv2.cvtColor(pcb_bin_clean, cv2.COLOR_GRAY2RGB)
         
-        pcb_bin = binarize_pcb_advanced(
-            img_pcb_aligned, 
-            filter_d, sigma_color, sigma_space, 
-            block_size, c_val, 
-            noise_method, morph_size, min_noise_area
-        )
-        cv2.imwrite(os.path.join(OUTPUT_DIR_ROOT, 'step2_pcb_binarized.jpg'), pcb_bin)
-        status_msg += "[2/3] Сегментация меди завершена.\n"
-
-        # Наложение маски для ограничения рабочей области
-        kernel_roi = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        roi_mask = cv2.dilate(gerber_bin, kernel_roi)
-
-        gerber_active = cv2.bitwise_and(gerber_bin, roi_mask)
-        pcb_active = cv2.bitwise_and(pcb_bin, roi_mask)
-
-        # 3. Поиск дефектов
-        kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        
-        # Обрывы
-        missing_copper = cv2.bitwise_and(gerber_active, cv2.bitwise_not(pcb_active))
-        missing_copper = cv2.morphologyEx(missing_copper, cv2.MORPH_OPEN, kernel_clean)
-
-        # Лишняя медь
-        excess_copper = cv2.bitwise_and(pcb_active, cv2.bitwise_not(gerber_active))
-        excess_copper = cv2.morphologyEx(excess_copper, cv2.MORPH_OPEN, kernel_clean)
-
-        output_visual = img_pcb_aligned.copy()
-
-        # Отрисовка обрывов (Исправлено: добавлен y-координата (x-2, y-2))
-        contours_missing, _ = cv2.findContours(missing_copper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        breaks_count = 0
-        for c in contours_missing:
-            if cv2.contourArea(c) > min_defect_area: 
-                breaks_count += 1
-                x, y, wc, hc = cv2.boundingRect(c)
-                cv2.rectangle(output_visual, (x - 2, y - 2), (x + wc + 2, y + hc + 2), (0, 0, 255), 2)
-                cv2.putText(output_visual, f"Break #{breaks_count}", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-
-        # Отрисовка лишней меди
-        contours_excess, _ = cv2.findContours(excess_copper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        extras_count = 0
-        for c in contours_excess:
-            if cv2.contourArea(c) > min_defect_area + 10:
-                extras_count += 1
-                x, y, wc, hc = cv2.boundingRect(c)
-                cv2.rectangle(output_visual, (x - 2, y - 2), (x + wc + 2, y + hc + 2), (255, 0, 0), 2)
-                cv2.putText(output_visual, f"Extra #{extras_count}", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-
-        # Сохранение результатов
-        result_path = os.path.join(OUTPUT_DIR_ROOT, 'PCB_INSPECTION_RESULT.jpg')
-        cv2.imwrite(result_path, output_visual)
-        
-        status_msg += f"[3/3] Анализ завершен!\nНайдено обрывов: {breaks_count}\nНайдено излишков: {extras_count}\n\nСохранено в '{result_path}'"
-        
-        output_visual_rgb = cv2.cvtColor(output_visual, cv2.COLOR_BGR2RGB)
-        pcb_bin_rgb = cv2.cvtColor(pcb_bin, cv2.COLOR_GRAY2RGB)
-        
-        return output_visual_rgb, pcb_bin_rgb, status_msg
+        return aligned_rgb, bin_raw_rgb, bin_clean_rgb, status_msg
 
     except Exception as e:
-        error_msg = f"[ОШИБКА ОБРАБОТКИ]: {str(e)}"
-        print(error_msg)
-        return None, None, error_msg
-
+        error_msg = f"[ОШИБКА]: {str(e)}"
+        return None, None, None, error_msg
 
 # ==========================================
 # 🖥️ ИНТЕРФЕЙС GRADIO
 # ==========================================
 theme = gr.themes.Soft(primary_hue="blue", secondary_hue="gray")
 
-# Инициализация параметров из сохраненной конфигурации
-initial_cfg = load_saved_config()
-
-# Исключаем theme из Blocks для совместимости с Gradio 6.0+
-with gr.Blocks(title="PCB Inspection AI") as demo:
+with gr.Blocks(theme=theme, title="PCB Step-by-Step Processing") as demo:
     gr.Markdown(
         """
-        # 🔍 Система автоматического контроля дефектов печатных плат
-        Загрузите эталонное изображение (Gerber) и реальное фото вашей платы. Настройте параметры бинаризации, чтобы убрать шум подложки и точно выделить проводящий рисунок.
+        # 🔍 Пошаговая визуализация обработки печатных плат
+        Программа автоматически находит границы платы, выпрямляет её, строит карту дорожек и убирает шумы.
         """
     )
     
     with gr.Row():
-        # Левая колонка: Загрузка файлов
-        with gr.Column(scale=1, min_width=300):
-            gr.Markdown("### 📥 Шаг 1: Входные данные")
-            gerber_input = gr.Image(label="Эталон (GERBER / Шаблон)", type="numpy")
+        with gr.Column(scale=1):
+            gr.Markdown("### 📥 Входные данные")
             pcb_input = gr.Image(label="Фото платы (PCB)", type="numpy")
             
-        # Средняя колонка: Интерактивные настройки
-        with gr.Column(scale=1, min_width=300):
-            gr.Markdown("### ⚙️ Шаг 2: Настройки бинаризации")
-            
-            # Переключатель пресетов
-            preset_dropdown = gr.Dropdown(
-                choices=list(PRESETS.keys()),
-                value="Стандартная плата",
-                label="📦 Быстрый пресет платы",
-                info="Автоматически устанавливает слайдеры под выбранный тип маски."
+            gr.Markdown("### ⚙️ Параметры")
+            block_size_slider = gr.Slider(
+                minimum=3, maximum=151, step=2, value=51, 
+                label="Размер блока бинаризации"
+            )
+            c_val_slider = gr.Slider(
+                minimum=-30, maximum=30, step=1, value=-15, 
+                label="Смещение порога (Constant C)"
             )
             
-            with gr.Accordion("1. Двусторонняя фильтрация (Bilateral)", open=False):
-                slider_d = gr.Slider(1, 25, value=initial_cfg.get("filter_d", 9), step=1, label="Диаметр фильтра (d)")
-                slider_sigma_color = gr.Slider(1, 200, value=initial_cfg.get("sigma_color", 75), step=5, label="Sigma Color")
-                slider_space = gr.Slider(1, 200, value=initial_cfg.get("sigma_space", 75), step=5, label="Sigma Space")
+            submit_btn = gr.Button("🚀 Запустить обработку", variant="primary")
+            status_output = gr.Textbox(label="Лог работы", interactive=False, lines=6)
 
-            with gr.Accordion("2. Адаптивный порог (Adaptive Threshold)", open=True):
-                slider_block = gr.Slider(
-                    minimum=3, maximum=101, step=2, value=initial_cfg.get("block_size", 11), 
-                    label="Размер локального блока"
-                )
-                slider_c = gr.Slider(
-                    minimum=-30, maximum=30, step=1, value=initial_cfg.get("c_val", 2), 
-                    label="Смещение порога (Constant C)"
-                )
+        with gr.Column(scale=2):
+            gr.Markdown("### 📤 Результаты по шагам")
             
-            with gr.Accordion("3. Очистка маски от шума", open=True):
-                radio_method = gr.Radio(
-                    choices=["Без очистки", "Морфологическое открытие (Быстро)", "Фильтрация по площади (Чисто)"],
-                    value=initial_cfg.get("noise_method", "Морфологическое открытие (Быстро)"),
-                    label="Метод очистки",
-                )
-                slider_morph = gr.Slider(1, 15, value=initial_cfg.get("morph_size", 4), step=1, label="Ядро морфологии")
-                slider_area = gr.Slider(0, 1000, value=initial_cfg.get("min_noise_area", 250), step=10, label="Мин. площадь шума (px)")
+            with gr.Tabs():
+                with gr.TabItem("Шаг 1: Обрезанная плата"):
+                    aligned_output = gr.Image(label="Обрезанное и выпрямленное фото")
+                    
+                with gr.TabItem("Шаг 2: Сырая маска"):
+                    raw_bin_output = gr.Image(label="Результат бинаризации")
+                    
+                with gr.TabItem("Шаг 3: Очищенная маска"):
+                    clean_bin_output = gr.Image(label="Результат без мелких шумов")
 
-            with gr.Accordion("4. Анализ дефектов", open=True):
-                min_defect_area_slider = gr.Slider(
-                    minimum=10, maximum=1000, step=10, value=initial_cfg.get("min_defect_area", 120), 
-                    label="Минимальный размер дефекта", 
-                    info="Игнорировать расхождения по площади меньше указанного количества пикселей."
-                )
-            
-            with gr.Row():
-                submit_btn = gr.Button("🚀 Анализ", variant="primary")
-                save_btn = gr.Button("💾 Сохранить параметры", variant="secondary")
-            
-            save_status = gr.Markdown() # Индикатор успешного сохранения
-            
-        # Правая колонка: Вывод результатов
-        with gr.Column(scale=1, min_width=300):
-            gr.Markdown("### 📤 Шаг 3: Результаты")
-            result_output = gr.Image(label="Найденные дефекты (Красный: Break / Синий: Extra)")
-            bin_output = gr.Image(label="Ч/Б Маска меди (Результат бинаризации)")
-            status_output = gr.Textbox(label="Лог работы системы", interactive=False, lines=5)
-
-    # Список всех управляющих слайдеров и переключателей
-    settings_inputs = [
-        slider_d, slider_sigma_color, slider_space,
-        slider_block, slider_c, radio_method,
-        slider_morph, slider_area, min_defect_area_slider
-    ]
-
-    # Логика автоматического применения пресетов
-    preset_dropdown.change(
-        fn=apply_preset,
-        inputs=[preset_dropdown],
-        outputs=settings_inputs
-    )
-
-    # Логика сохранения настроек
-    save_btn.click(
-        fn=save_current_config,
-        inputs=settings_inputs,
-        outputs=[save_status]
-    )
-
-    # Запуск анализа печатной платы
     submit_btn.click(
-        fn=inspect_pcb_interface,
-        inputs=[gerber_input, pcb_input] + settings_inputs,
-        outputs=[result_output, bin_output, status_output]
-    )
-
-    # Автоматическое восстановление сохраненного конфига при первой загрузке страницы
-    def on_load_restore():
-        cfg = load_saved_config()
-        return (
-            cfg.get("filter_d", 9), cfg.get("sigma_color", 75), cfg.get("sigma_space", 75),
-            cfg.get("block_size", 11), cfg.get("c_val", 2), cfg.get("noise_method", "Морфологическое открытие (Быстро)"),
-            cfg.get("morph_size", 4), cfg.get("min_noise_area", 250), cfg.get("min_defect_area", 120)
-        )
-
-    demo.load(
-        fn=on_load_restore,
-        outputs=settings_inputs
+        fn=_order_corners,
+        inputs=[pcb_input, block_size_slider, c_val_slider],
+        outputs=[aligned_output, raw_bin_output, clean_bin_output, status_output]
     )
 
 if __name__ == "__main__":
-    # Тема перенесена в метод .launch() для соответствия стандартам Gradio 6.0
-    demo.launch(share=False, theme=theme)
+    demo.launch(share=False)
