@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 metki.py image1.png --out /tmp/a.png)",
+      "Bash(python3 -c ' *)",
+      "Bash(cd \"/home/sirius/Документы/GitHub/GestiTech-Travla/Code/метки cv\" && rm -f _r_*.png _c_*.png && echo ok)",
+      "Bash(python3 metki.py file GERBER.png --out /tmp/g.png)",
+      "Bash(python3 metki.py camera PCB1.png --out /tmp/p.png)"
+    ],
+    "additionalDirectories": [
+      "/home/sirius/Документы/GitHub/GestiTech-Travla/Code/метки cv"
+    ]
+  }
+}
