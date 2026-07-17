@@ -23,7 +23,8 @@ PRESETS = {
         "noise_method": "Морфологическое открытие (Быстро)",
         "morph_size": 4,
         "min_noise_area": 250,
-        "min_defect_area": 120
+        "min_defect_area": 120,
+        "morph_t": 0.15
     },
     "Плата с фоторезистом и медью": {
         "filter_d": 15,            # Более сильное размытие для текстуры фоторезиста
@@ -72,11 +73,6 @@ def apply_preset(preset_name):
         p["morph_size"], p["min_noise_area"], p["min_defect_area"]
     )
 
-
-# ==========================================
-# 🛠️ ФУНКЦИИ ОБРАБОТКИ
-# ==========================================
-
 def _order_corners(pts):
     pts = pts.reshape(4, 2).astype(np.float32)
     ordered = np.zeros((4, 2), dtype=np.float32)
@@ -89,7 +85,6 @@ def _order_corners(pts):
     ordered[1] = pts[np.argmin(diff)]  # верх-право
     ordered[3] = pts[np.argmax(diff)]  # низ-лево
     return ordered
-
 
 def _detect_board_quad(img_pcb, gerber_aspect):
     h, w = img_pcb.shape[:2]
@@ -146,7 +141,6 @@ def _detect_board_quad(img_pcb, gerber_aspect):
 
     return _order_corners(box)
 
-
 def align_images_orb(img_gerber, img_pcb):
     gh, gw = img_gerber.shape[:2]
     gerber_aspect = min(gw / gh, gh / gw)
@@ -169,7 +163,6 @@ def align_images_orb(img_gerber, img_pcb):
 
     return img_pcb_aligned
 
-
 def _edge_map(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.createCLAHE(2.0, (8, 8)).apply(gray)
@@ -177,7 +170,6 @@ def _edge_map(img):
     edges = cv2.Canny(gray, 50, 150)
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
     return edges
-
 
 def refine_registration_orb(img_gerber, img_pcb_aligned):
     gh, gw = img_gerber.shape[:2]
@@ -207,7 +199,6 @@ def refine_registration_orb(img_gerber, img_pcb_aligned):
 
     return cv2.warpPerspective(img_pcb_aligned, H, (gw, gh))
 
-
 def remove_noise_by_contours(binary_img, min_area):
     if min_area <= 0:
         return binary_img
@@ -221,32 +212,100 @@ def remove_noise_by_contours(binary_img, min_area):
     return clean_mask
 
 
-def binarize_pcb_advanced(img_aligned, filter_d, sigma_color, sigma_space, block_size, c_val, noise_method, morph_size, min_noise_area):
-    """ Адаптивное выделение меди на основе локального контраста с ручными параметрами """
-    b, g, r = cv2.split(img_aligned)
+# def binarize_pcb_advanced(img_aligned, filter_d, sigma_color, sigma_space, block_size, c_val, noise_method, morph_size, min_noise_area):
+#     """ Адаптивное выделение меди на основе локального контраста с ручными параметрами """
+#     b, g, r = cv2.split(img_aligned)
     
-    # Медь сильнее отражает красный канал, подложка — зеленый
-    diff = cv2.subtract(r, g)
-    diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+#     # Медь сильнее отражает красный канал, подложка — зеленый
+#     diff = cv2.subtract(r, g)
+#     diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
     
-    # Убедимся, что размер блока нечетный и больше 1
-    if block_size % 2 == 0:
-        block_size += 1
-    if block_size < 3:
-        block_size = 3
+#     # Убедимся, что размер блока нечетный и больше 1
+#     if block_size % 2 == 0:
+#         block_size += 1
+#     if block_size < 3:
+#         block_size = 3
 
-    # Бинаризация Гаусса с внешними параметрами
-    cleaned = cv2.adaptiveThreshold(
-        diff, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, block_size, c_val
-    )
+#     # Бинаризация Гаусса с внешними параметрами
+#     cleaned = cv2.adaptiveThreshold(
+#         diff, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+#         cv2.THRESH_BINARY, block_size, c_val
+#     )
     
-    # Убираем шумы
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-    return cleaned
+#     # Убираем шумы
+#     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+#     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+#     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+#     return cleaned
 
+def bradley_threshold(image_path, t):
+    # 1. Загружаем изображение в градациях серого
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError("Не удалось загрузить изображение.")
+        
+    h, w = img.shape
+    
+    # 2. Определяем размер локального окна (1/8 от ширины)
+    # Окно обязательно должно быть нечетным для центрирования
+    S = w // 8
+    if S % 2 == 0:
+        S += 1
+        
+    # 3. Находим среднее значение в окрестности каждого пикселя.
+    # boxFilter делает то же самое, что и ручной обход интегрального изображения, но на C++
+    mean_img = cv2.boxFilter(img, ddepth=cv2.CV_32F, ksize=(S, S), borderType=cv2.BORDER_REPLICATE)
+    
+    # 4. Рассчитываем порог по формуле Брэдли: Mean * (1.0 - t)
+    threshold = mean_img * (1.0 - t)
+    
+    # 5. Бинаризация: если пиксель меньше порога -> 0, иначе -> 255
+    # res = np.where(img < threshold, 0, 255).astype(np.uint8)
+    res = np.where(img >= threshold, 0, 255).astype(np.uint8)
+    
+    return res
+
+
+def apply_morphology(img, op_type="open", kernel_size=3, shape="rect"):
+    """
+    Выполняет морфологические операции над бинарным или полутоновым изображением.
+    
+    :param img: Входное изображение (numpy array).
+    :param op_type: Тип операции ('open', 'close', 'erode', 'dilate').
+    :param kernel_size: Размер структурирующего элемента (нечетное число >= 1).
+    :param shape: Форма ядра ('rect' - прямоугольник, 'ellipse' - эллипс, 'cross' - крест).
+    :return: Обработанное изображение.
+    """
+    if img is None:
+        return None
+        
+    # Гарантируем, что размер ядра корректный (нечетный и не меньше 1)
+    kernel_size = max(1, int(kernel_size))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    # Выбираем форму структурирующего элемента
+    if shape == "ellipse":
+        morph_shape = cv2.MORPH_ELLIPSE
+    elif shape == "cross":
+        morph_shape = cv2.MORPH_CROSS
+    else:
+        morph_shape = cv2.MORPH_RECT
+
+    kernel = cv2.getStructuringElement(morph_shape, (kernel_size, kernel_size))
+
+    # Выполняем операцию
+    op_type = op_type.lower()
+    if "open" in op_type:       # Морфологическое открытие (убирает мелкий белый шум)
+        return cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
+    elif "close" in op_type:    # Морфологическое закрытие (заполняет дыры внутри объектов)
+        return cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
+    elif "erode" in op_type:    # Эрозия (сужение белых областей)
+        return cv2.erode(img, kernel, iterations=1)
+    elif "dilate" in op_type:   # Дилатация (расширение белых областей)
+        return cv2.dilate(img, kernel, iterations=1)
+    
+    return img
 
 def inspect_pcb_interface(
     gerber_img, pcb_img, 
@@ -255,11 +314,17 @@ def inspect_pcb_interface(
     noise_method, morph_size, min_noise_area, 
     min_defect_area
 ):
+    # 1. Проверяем, загружены ли оба изображения в интерфейсе
     if gerber_img is None or pcb_img is None:
         return None, None, "Пожалуйста, загрузите оба изображения (Шаблон и Фото платы)."
 
-    img_gerber = cv2.cvtColor(gerber_img, cv2.COLOR_RGB2BGR)
-    img_pcb = cv2.cvtColor(pcb_img, cv2.COLOR_RGB2BGR)
+    # Так как в Gradio стоит type="numpy", изображения уже прочитаны в память.
+    # Нам нужно лишь перевести их из формата RGB (стандарт Gradio/PIL) в BGR (стандарт OpenCV)
+    try:
+        img_gerber = cv2.cvtColor(gerber_img, cv2.COLOR_RGB2BGR)
+        img_pcb = cv2.cvtColor(pcb_img, cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        return None, None, f"Ошибка конвертации формата изображений: {str(e)}"
 
     status_msg = "Статус: Начинаем обработку...\n"
     
@@ -274,11 +339,11 @@ def inspect_pcb_interface(
         gerber_gray = cv2.cvtColor(img_gerber, cv2.COLOR_BGR2GRAY)
         _, gerber_bin = cv2.threshold(gerber_gray, 127, 255, cv2.THRESH_BINARY)
         
-        pcb_bin = binarize_pcb_advanced(
-            img_pcb_aligned, 
-            filter_d, sigma_color, sigma_space, 
-            block_size, c_val, 
-            noise_method, morph_size, min_noise_area
+        # Функция bradley_threshold в вашем коде ожидает path к файлу на диске. 
+        # Передаем туда только что сохраненный выровненный файл.
+        pcb_aligned_path = os.path.join(OUTPUT_DIR_ROOT, 'step1_pcb_aligned.jpg')
+        pcb_bin = bradley_threshold(
+            pcb_aligned_path, t=morph_t
         )
         cv2.imwrite(os.path.join(OUTPUT_DIR_ROOT, 'step2_pcb_binarized.jpg'), pcb_bin)
         status_msg += "[2/3] Сегментация меди завершена.\n"
@@ -295,15 +360,27 @@ def inspect_pcb_interface(
         
         # Обрывы
         missing_copper = cv2.bitwise_and(gerber_active, cv2.bitwise_not(pcb_active))
-        missing_copper = cv2.morphologyEx(missing_copper, cv2.MORPH_OPEN, kernel_clean)
-
+        
+        # Вместо cv2.morphologyEx пишем вызов нашей функции:
+        missing_copper = apply_morphology(
+            img=missing_copper, 
+            op_type="open", 
+            kernel_size=3, 
+            shape="rect"
+        )
         # Лишняя медь
         excess_copper = cv2.bitwise_and(pcb_active, cv2.bitwise_not(gerber_active))
-        excess_copper = cv2.morphologyEx(excess_copper, cv2.MORPH_OPEN, kernel_clean)
-
+        
+        # Точно так же заменяем здесь:
+        excess_copper = apply_morphology(
+            img=excess_copper, 
+            op_type="open", 
+            kernel_size=3, 
+            shape="rect"
+        )
         output_visual = img_pcb_aligned.copy()
 
-        # Отрисовка обрывов (Исправлено: добавлен y-координата (x-2, y-2))
+        # Отрисовка обрывов
         contours_missing, _ = cv2.findContours(missing_copper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         breaks_count = 0
         for c in contours_missing:
@@ -335,9 +412,14 @@ def inspect_pcb_interface(
         return output_visual_rgb, pcb_bin_rgb, status_msg
 
     except Exception as e:
-        error_msg = f"[ОШИБКА ОБРАБОТКИ]: {str(e)}"
-        print(error_msg)
-        return None, None, error_msg
+        err_msg = f"[ОШИБКА ОБРАБОТКИ]: {str(e)}"
+        print(err_msg)
+        return None, None, err_msg
+    except Exception as e:
+        err_msg = f"[ОШИБКА ОБРАБОТКИ]: {str(e)}"
+        print(err_msg)
+        # Возвращаем None для картинок и текст ошибки для текстового поля status_output
+        return None, None, err_msg
 
 
 # ==========================================
@@ -399,6 +481,7 @@ with gr.Blocks(title="PCB Inspection AI") as demo:
                 )
                 slider_morph = gr.Slider(1, 15, value=initial_cfg.get("morph_size", 4), step=1, label="Ядро морфологии")
                 slider_area = gr.Slider(0, 1000, value=initial_cfg.get("min_noise_area", 250), step=10, label="Мин. площадь шума (px)")
+                morph_t = gr.Slider(0, 1, value=0.15, step=0.05, label="T для алгориитма Бредли")
 
             with gr.Accordion("4. Анализ дефектов", open=True):
                 min_defect_area_slider = gr.Slider(
@@ -424,7 +507,7 @@ with gr.Blocks(title="PCB Inspection AI") as demo:
     settings_inputs = [
         slider_d, slider_sigma_color, slider_space,
         slider_block, slider_c, radio_method,
-        slider_morph, slider_area, min_defect_area_slider
+        slider_morph, slider_area, morph_t, min_defect_area_slider
     ]
 
     # Логика автоматического применения пресетов
