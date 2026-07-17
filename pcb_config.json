@@ -1,0 +1,11 @@
+{
+    "filter_d": 9,
+    "sigma_color": 75,
+    "sigma_space": 75,
+    "block_size": 51,
+    "c_val": -15,
+    "noise_method": "Морфологическое открытие (Быстро)",
+    "morph_size": 4,
+    "min_noise_area": 250,
+    "min_defect_area": 120
+}

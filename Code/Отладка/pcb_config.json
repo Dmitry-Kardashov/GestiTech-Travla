@@ -1,0 +1,11 @@
+{
+    "filter_d": 15,
+    "sigma_color": 120,
+    "sigma_space": 100,
+    "block_size": 57,
+    "c_val": -2,
+    "noise_method": "Фильтрация по площади (Чисто)",
+    "morph_size": 1,
+    "min_noise_area": 0,
+    "min_defect_area": 150
+}
