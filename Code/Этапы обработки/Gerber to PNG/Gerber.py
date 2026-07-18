@@ -5,13 +5,11 @@
     pip install pygerber --break-system-packages
 
 Использование:
-    python gerber_to_png.py input.gbr output.png
-    python gerber_to_png.py input.gbr output.png --dpmm 40 --color "#00FF00"
+    Настройте пути к файлам в блоке `if __name__ == "__main__":` и запустите скрипт:
+    python gerber_to_png.py
 """
 
-import argparse
 from pathlib import Path
-
 from pygerber.gerberx3.api.v2 import GerberFile, ColorScheme, PixelFormatEnum
 from pygerber.common.rgba import RGBA
 
@@ -61,27 +59,20 @@ def gerber_to_png(
     print(f"Готово: {output_path}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Gerber -> PNG (один слой, дорожки)")
-    parser.add_argument("input", help="путь к Gerber-файлу слоя")
-    parser.add_argument("output", help="путь к результирующему PNG")
-    parser.add_argument("--dpmm", type=int, default=40, help="разрешение, точек/мм (по умолчанию 40)")
-    parser.add_argument("--color", default="#FFFFFF", help="цвет дорожек в HEX, напр. #00FF00")
-    parser.add_argument(
-        "--no-transparent",
-        action="store_true",
-        help="сделать фон чёрным вместо прозрачного",
-    )
-    args = parser.parse_args()
+if __name__ == "__main__":
+    # === НАСТРОЙКИ ВНУТРИ КОДА ===
+    INPUT_FILE = "input.gbr"       # Путь к твоему Gerber-файлу
+    OUTPUT_FILE = "output.png"     # Куда сохранить получившийся PNG
+    
+    DPMM = 40                      # Разрешение (точек на мм)
+    TRACK_COLOR = "#FFFFFF"        # Цвет дорожек в формате HEX (например, "#00FF00" для зелёного)
+    TRANSPARENT = True             # True — прозрачный фон, False — чёрный фон
+    # =============================
 
     gerber_to_png(
-        input_path=args.input,
-        output_path=args.output,
-        dpmm=args.dpmm,
-        track_color=args.color,
-        transparent_background=not args.no_transparent,
+        input_path="INPUT_FILE",
+        output_path="OUTPUT_FILE",
+        dpmm=DPMM,
+        track_color=TRACK_COLOR,
+        transparent_background=TRANSPARENT,
     )
-
-
-if __name__ == "__main__":
-    main()
