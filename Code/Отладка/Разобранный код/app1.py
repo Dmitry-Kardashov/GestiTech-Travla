@@ -8,8 +8,19 @@ import gradio as gr
 
 
 import arduinoControl
+import camera
 
-
+css = """
+.no-buttons [class*="button"], 
+.no-buttons [id*="button"],
+.no-buttons div[style*="position: absolute"] button,
+.no-buttons svg {
+    display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+"""
 
 
 # ==========================================
@@ -20,8 +31,8 @@ TRACK_COLOR = "#FFFFFF"
 TRANSPARENT = True             
 
 DEFAULT_CONFIG = {
-    "output_dir": "Code/Отладка/Разобранный код/debugging_inspection",      
-    "path_output": "Code/Отладка/Разобранный код/PCB_GBR.png",
+    "output_dir": "debugging_inspection",      
+    "path_output": "PCB_GBR.png",
     "max_working_side": 2200,
     "filter_d": 9,
     "sigma_color": 75,
@@ -399,26 +410,35 @@ def run_inspection(
     
     return output_visual_rgb, report_text
 
+
+
 # Строим интерфейс Gradio
-with gr.Blocks(title="Травля в Сириусе") as demo:
+with gr.Blocks(title="Травилка") as demo:
     with gr.Row():
         # Первый логотип
-        gr.Markdown("# Травля в Сириусе (название короткое)")
+        gr.Markdown("# Система определения печатных плат при травлении")
         gr.Image(
-            value="Code/Отладка/Разобранный код/Web/Логотип_black.svg", # Укажите реальный путь к первому логотипу
+            value="Web/Логотип_black.svg", # Укажите реальный путь к первому логотипу
             show_label=False, 
             container=False, 
             height=80, 
             interactive=False, 
+            elem_classes="no-buttons",
+            # show_download_button=False
+            buttons=[]  # Скрывает все встроенные кнопки
         )
         # Второй логотип (если нужен, или можно удалить этот gr.Image)
         gr.Image(
-            value="Code/Отладка/Разобранный код/Web/БВ Лого.svg", # Укажите реальный путь ко второму логотипу
+            value="Web/БВ Лого.svg", # Укажите реальный путь ко второму логотипу
             show_label=False, 
             container=False, 
             height=80, 
             interactive=False, 
+            elem_classes="no-buttons",
+            # show_download_button=False
+            buttons=[]  # Скрывает все встроенные кнопки
         )
+        # gr.HTML(f'<img src="file/Web/Логотип_black.svg" style="max-width:100%; height:80; border-radius:8px;">')
 
 
  
@@ -428,7 +448,7 @@ with gr.Blocks(title="Травля в Сириусе") as demo:
         with gr.TabItem("Главная"):
             with gr.Row():
                 with gr.Column():
-                    gr.Markdown("### 📂 Выберите файлы в проводнике")
+                    gr.Markdown("### Выберите файлы в проводнике")
                     
                     # Заменили текстовые поля на кнопки загрузки файлов
                     input_gbr_file = gr.File(
@@ -443,30 +463,30 @@ with gr.Blocks(title="Травля в Сириусе") as demo:
                     with gr.Row():
                         btn_start_work = gr.Button("Начать работу", variant="secondary")
                         btn_run_main = gr.Button("Работа (тестирование)", variant="primary")
-                        
+                        btn_open_cam = gr.Button("Открыть камеру", variant="secondary")
                     status_output = gr.Textbox(label="Статус системы / Лог пустой функции", placeholder="Здесь будет лог...")
                     
                 with gr.Column():
-                    gr.Markdown("### 📊 Результат анализа")
+                    gr.Markdown("### Результат анализа")
                     result_image = gr.Image(label="Карта дефектов")
                     result_report = gr.Textbox(label="Отчет", lines=6)
 
         # Вторая вкладка: Настройки
-        with gr.TabItem("⚙️ Настройки пайплайна"):
+        with gr.TabItem("Настройки"):
             gr.Markdown("### Тонкая настройка алгоритмов обработки изображений")
             
             with gr.Row():
                 with gr.Column():
-                    gr.Markdown("#### 📐 Разрешение и геометрия")
+                    gr.Markdown("#### Разрешение и геометрия")
                     cfg_max_working_side = gr.Number(label="max_working_side", value=DEFAULT_CONFIG["max_working_side"], precision=0)
                     
-                    gr.Markdown("#### 🌫️ Билинейная фильтрация (Bilateral Filter)")
+                    gr.Markdown("#### Билинейная фильтрация (Bilateral Filter)")
                     cfg_filter_d = gr.Slider(label="filter_d", minimum=1, maximum=25, step=1, value=DEFAULT_CONFIG["filter_d"])
                     cfg_sigma_color = gr.Slider(label="sigma_color", minimum=10, maximum=200, step=5, value=DEFAULT_CONFIG["sigma_color"])
                     cfg_sigma_space = gr.Slider(label="sigma_space", minimum=10, maximum=200, step=5, value=DEFAULT_CONFIG["sigma_space"])
 
                 with gr.Column():
-                    gr.Markdown("#### 🌗 Бинаризация и Очистка шума")
+                    gr.Markdown("#### Бинаризация и Очистка шума")
                     cfg_block_size = gr.Slider(label="block_size", minimum=3, maximum=151, step=2, value=DEFAULT_CONFIG["block_size"])
                     cfg_c_val = gr.Slider(label="c_val", minimum=-50, maximum=50, step=1, value=DEFAULT_CONFIG["c_val"])
                     cfg_noise_method = gr.Dropdown(
@@ -478,7 +498,7 @@ with gr.Blocks(title="Травля в Сириусе") as demo:
                     cfg_min_noise_area = gr.Number(label="min_noise_area", value=DEFAULT_CONFIG["min_noise_area"], precision=0)
 
                 with gr.Column():
-                    gr.Markdown("#### 🪲 Порог площади дефектов")
+                    gr.Markdown("#### Порог площади дефектов")
                     cfg_min_defect_area = gr.Number(label="min_defect_area", value=DEFAULT_CONFIG["min_defect_area"], precision=0)
                     cfg_large_defect_area = gr.Number(label="large_defect_area (Критический порог)", value=DEFAULT_CONFIG["large_defect_area"], precision=0)
 
@@ -487,6 +507,12 @@ with gr.Blocks(title="Травля в Сириусе") as demo:
         fn=arduinoControl.Arduino_Control,
         inputs=[],
         outputs=[status_output]
+    )
+
+    btn_open_cam.click(
+        fn=camera.CameraInit,
+        inputs=[],
+        outputs=[]
     )
     
     btn_run_main.click(
@@ -500,9 +526,13 @@ with gr.Blocks(title="Травля в Сириусе") as demo:
         outputs=[result_image, result_report]
     )
 
-if __name__ == "__main__":
+def main():
     demo.launch(share=False)
+    # camera.CameraInit()
 
 
+if __name__ == "__main__":
+    main()
 
 
+                       

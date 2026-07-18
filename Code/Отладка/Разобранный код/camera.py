@@ -1,8 +1,8 @@
-import numpy as np
 import cv2
+import numpy as np
+import os
 
-
-CALIB = "camera_calibration.npz"   # файл калибровки (None -> без коррекции дисторсии)
+CALIB = "camera_calibration1.npz"   # файл калибровки (None -> без коррекции дисторсии)
 
 # --- Параметры камеры (IMX577, UVC) ---
 # Поддерживаемые режимы MJPG@30fps: 1280x720, 1920x1080, 2592x1944,
@@ -11,6 +11,8 @@ CALIB = "camera_calibration.npz"   # файл калибровки (None -> бе
 CAP_W, CAP_H = 1920, 1080
 DISPLAY_WIDTH = 1280        # ширина окна на экране (кадр только МАСШТАБИРУЕТСЯ)
 FOCUS_START = 100           # стартовый фокус (0..255), моторизованный объектив
+
+pcb_dir = "pcb_pic"
 
 
 def open_camera():
@@ -30,8 +32,16 @@ def open_camera():
     cap.set(cv2.CAP_PROP_FOCUS, FOCUS_START)
     return cap
 
+def load_calibration(path: str):
+    """Загружает матрицу камеры и коэффициенты дисторсии из .npz."""
+    with np.load(path) as d:
+        return d["mtx"], d["dist"]
+    
 
-def main():
+
+
+
+def CameraInit():
     cap = open_camera()
     aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -55,13 +65,60 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, DISPLAY_WIDTH, disp_h)
 
+    focus, autofocus, shot = FOCUS_START, False, 0
+    undist, process = maps is not None, False
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Ошибка: нет кадра.")
+            break
+
+        if undist and maps is not None:          # коррекция на полном кадре
+            frame = cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
+
+        disp = cv2.resize(frame, (DISPLAY_WIDTH, disp_h), interpolation=cv2.INTER_AREA)
+        
+      
+        cv2.imshow(win, disp)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("f"):
+            autofocus = not autofocus
+            cap.set(cv2.CAP_PROP_AUTOFOCUS, int(autofocus))
+            if not autofocus:
+                cap.set(cv2.CAP_PROP_FOCUS, focus)
+        elif key in (ord("d"), ord("a")) and not autofocus:
+            focus = min(255, focus + 5) if key == ord("d") else max(0, focus - 5)
+            cap.set(cv2.CAP_PROP_FOCUS, focus)
+        elif key == ord("u") and maps is not None:
+            undist = not undist
+        elif key == ord("p"):
+            process = not process
+        elif key == ord("s"):
+            # cv2.imwrite('snapshot.png', frame)
+            take_snapshot(frame)
+
     cap.release()
     cv2.destroyAllWindows()
 
-def load_calibration(path: str):
-    """Загружает матрицу камеры и коэффициенты дисторсии из .npz."""
-    with np.load(path) as d:
-        return d["mtx"], d["dist"]
+
+def take_snapshot(frame):
+    counter = 1
+    while True:
+            file_name = f"{counter}.jpg"
+            full_path = os.path.join(pcb_dir, file_name)
+            
+            if not os.path.exists(full_path):
+                break  # Нашли свободное имя, выходим из цикла поиска
+            counter += 1
+
+    # Сохраняем кадр
+    cv2.imwrite(full_path, frame)
+    print(f"Снимок сохранен: {full_path}")
+
+
 
 if __name__ == "__main__":
-    main()
+    CameraInit()

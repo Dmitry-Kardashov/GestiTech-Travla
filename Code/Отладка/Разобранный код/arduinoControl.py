@@ -1,6 +1,7 @@
 import threading
 import serial  # Добавляем библиотеку для работы с Serial
 import time
+import camera
 
 # Инициализация Serial-порта. 
 # Замените 'COM3' (для Windows) или '/dev/ttyUSB0' (для Linux/macOS) на порт вашей Arduino
@@ -43,6 +44,7 @@ def ParceCommand(command: str):
     if cmd_type == "motor:complete":
         last_arduino_message = "Плата проехала, делаем снимок"
         # Здесь можно автоматически вызвать какую-то логику Python
+        camera.take_snapshot(camera.frame)
         
     elif cmd_type == "motor:btnstop":
         last_arduino_message = "Остановка по концевику"

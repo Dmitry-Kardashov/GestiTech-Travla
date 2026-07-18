@@ -1,6 +1,6 @@
 import cv2
 
-from metki import load_calibration, undistort, detect, draw_debug
+# from metki import load_calibration, undistort, detect, draw_debug
 
 CALIB = "camera_calibration.npz"   # файл калибровки (None -> без коррекции дисторсии)
 
