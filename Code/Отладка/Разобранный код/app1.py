@@ -46,7 +46,10 @@ DEFAULT_CONFIG = {
     "large_defect_area": 200 * 4
 }
 
+Input_skleika = 'pcb_pic'
 
+# Путь и имя итогового файла панорамы
+output_skleika = './PCB_Skleika.jpg'
 # ==========================================
 # 🛠️ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ
 # ==========================================
@@ -525,10 +528,130 @@ with gr.Blocks(title="Травилка") as demo:
         ],
         outputs=[result_image, result_report]
     )
+def get_homography(img_src, img_dst):
+    """Находит гомографию между двумя соседними изображениями"""
+    sift = cv2.SIFT_create()
+    kp_src, des_src = sift.detectAndCompute(img_src, None)
+    kp_dst, des_dst = sift.detectAndCompute(img_dst, None)
+    
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des_src, des_dst, k=2)
+    
+    good = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good.append(m)
+            
+    if len(good) < 4:
+        raise ValueError("Недостаточно общих точек между соседними кадрами!")
+        
+    src_pts = np.float32([kp_src[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp_dst[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    
+    H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    return H
+
+def stitch_all_from_folder():
+    # Поддерживаемые форматы изображений
+    extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
+    image_paths = []
+    
+    # Собираем все файлы по маске расширений
+    for ext in extensions:
+        image_paths.extend(Input_skleika, ext)
+        
+    # Сортируем файлы по имени (чтобы порядок гарантированно шел снизу вверх)
+    image_paths = sorted(image_paths)
+    
+    num_images = len(image_paths)
+    if num_images < 2:
+        print(f"Ошибка: В папке '{Input_skleika}' найдено картинок: {num_images}. Для склейки нужно минимум 2!")
+        return
+
+    print(f"Успешно найдено {num_images} изображений в папке '{Input_skleika}'")
+    print("Порядок сшивания:")
+    for path in image_paths:
+        print(f" -> {os.path.basename(path)}")
+
+    # Загружаем изображения в память
+    images = [cv2.imread(path) for path in image_paths]
+    
+    # 1. Выбираем центральный кадр в качестве базы
+    base_idx = num_images // 2
+    print(f"\nЦентральный опорный кадр (база): {os.path.basename(image_paths[base_idx])}")
+
+    # 2. Считаем гомографии между соседними парами
+    H_neighbors = {}
+    for i in range(num_images - 1):
+        img_name_1 = os.path.basename(image_paths[i])
+        img_name_2 = os.path.basename(image_paths[i+1])
+        print(f"Ищем пересечения: {img_name_1} <-> {img_name_2}...")
+        H_neighbors[i] = get_homography(images[i], images[i+1])
+
+    # 3. Цепное приведение матриц к единой базе (base_idx)
+    homographies = [None] * num_images
+    homographies[base_idx] = np.eye(3)
+
+    # Движение вниз к началу списка
+    for i in range(base_idx - 1, -1, -1):
+        homographies[i] = np.dot(homographies[i+1], H_neighbors[i])
+
+    # Движение вверх к концу списка
+    for i in range(base_idx + 1, num_images):
+        H_inv = np.linalg.inv(H_neighbors[i-1])
+        homographies[i] = np.dot(homographies[i-1], H_inv)
+
+    # 4. Расчет общих границ итогового холста
+    all_corners = []
+    for i, img in enumerate(images):
+        h, w = img.shape[:2]
+        corners = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
+        transformed_corners = cv2.perspectiveTransform(corners, homographies[i])
+        all_corners.append(transformed_corners)
+
+    all_corners = np.concatenate(all_corners, axis=0)
+    [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+    [x_max, y_max] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+
+    # 5. Создаем матрицу сдвига холста
+    translation_dist = [-x_min, -y_min]
+    H_translation = np.array([[1, 0, translation_dist[0]], 
+                              [0, 1, translation_dist[1]], 
+                              [0, 0, 1]])
+
+    canvas_width = x_max - x_min
+    canvas_height = y_max - y_min
+    print(f"\nИтоговое разрешение панорамы: {canvas_width}x{canvas_height} px")
+
+    # 6. Трансформируем все кадры на общий холст
+    warped_images = []
+    for i, img in enumerate(images):
+        H_translated = np.dot(H_translation, homographies[i])
+        warped = cv2.warpPerspective(img, H_translated, (canvas_width, canvas_height))
+        warped_images.append(warped)
+
+    # 7. Послойное наложение (базовые кадры накладываются поверх крайних)
+    result = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    render_order = sorted(range(num_images), key=lambda x: abs(x - base_idx), reverse=True)
+
+    print("Сборка финального изображения...")
+    for idx in render_order:
+        img_warped = warped_images[idx]
+        mask = (img_warped > 0)
+        result[mask] = img_warped[mask]
+
+    # Создаем папку для сохранения, если её нет
+    output_dir = os.path.dirname(output_skleika)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Сохраняем результат
+    cv2.imwrite(output_skleika, result)
+    print(f"Успех! Панорама сохранена здесь: {output_skleika}")
 
 def main():
     demo.launch(share=False)
-    # camera.CameraInit()
+    camera.CameraInit()
 
 
 if __name__ == "__main__":

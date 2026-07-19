@@ -1,15 +1,13 @@
 import threading
-import serial  # Добавляем библиотеку для работы с Serial
+import serial  
 import time
 import camera
+# Вместо закомментированного app1, если функции склейки лежат в главном файле (например, main.py),
+# то правильнее импортировать конкретную функцию или сам модуль, когда структура проекта зафиксирована.
 
-# Инициализация Serial-порта. 
-# Замените 'COM3' (для Windows) или '/dev/ttyUSB0' (для Linux/macOS) на порт вашей Arduino
 SERIAL_PORT = '/dev/ttyUSB0' 
-BAUD_RATE = 9600
+BAUD_RATE = 115200
 last_arduino_message = "Пока нет команд от Arduino"
-
-
 
 def arduino_listener():
     """Фоновая функция, которая постоянно слушает Serial-порт"""
@@ -20,43 +18,45 @@ def arduino_listener():
         if arduino and arduino.is_open:
             try:
                 if arduino.in_waiting > 0:
-                    # Читаем строку, декодируем и убираем пробелы/переносы
                     line = arduino.readline().decode('utf-8').strip()
                     if line:
                         print(f"📥 Получено от Arduino: {line}")
-                        
-                        # Роутер/Обработчик команд
                         ParceCommand(line)
-                        
             except Exception as e:
                 print(f"❌ Ошибка чтения Serial: {e}")
                 time.sleep(1)
-        time.sleep(0.05) # Небольшая пауза, чтобы не перегружать процессор
+        time.sleep(0.05) 
 
 def ParceCommand(command: str):
-    """Собственно обработчик входящих команд от микроконтроллера"""
+    """Обработчик входящих команд от микроконтроллера"""
     global last_arduino_message
     
-    # Разделяем команду и аргументы, если они есть (например, "TEMP:24")
     parts = command.split(":")
     cmd_type = parts[0]
     
     if cmd_type == "motor:complete":
         last_arduino_message = "Плата проехала, делаем снимок"
-        # Здесь можно автоматически вызвать какую-то логику Python
         camera.take_snapshot(camera.frame)
         
     elif cmd_type == "motor:btnstop":
         last_arduino_message = "Остановка по концевику"
+        camera.take_snapshot(camera.frame)
+        # ИСПРАВЛЕНО: Избегаем NameError, если app1 не импортирован
+        try:
+            import main # или как называется твой основной файл со stitch_all_from_folder
+            main.stitch_all_from_folder()
+        except ImportError:
+            print("⚠️ Не удалось импортировать модуль для склейки.")
         
     else:
         last_arduino_message = f"Получена неизвестная команда: {command}"
 
-
-def Arduino_Control():
-    """Функция для кнопки 'Начать работу', отправляющая команду на Arduino"""
-    command = "START\n" # Строка команды, которую ждет Arduino (символ \n важен для завершения строки)
-    command = "motor1:up;" + str(300)
+# ИСПРАВЛЕНО: Сделали функцию универсальной, принимающей направление
+def Arduino_Control(direction: str = "up", steps: int = 300):
+    """Функция отправки команды движения на Arduino (добавлен \n в конец)"""
+    
+    # Формируем команду и ОБЯЗАТЕЛЬНО добавляем \n
+    command = f"move:{direction};{steps}\n"
     
     if arduino and arduino.is_open:
         try:
@@ -67,7 +67,6 @@ def Arduino_Control():
             # Отправляем команду, закодированную в байты
             arduino.write(command.encode('utf-8'))
             
-            # Опционально: ждем ответ от Arduino (например, если она должна прислать "OK")
             time.sleep(0.1)
             response = arduino.readline().decode('utf-8').strip()
             
@@ -79,17 +78,19 @@ def Arduino_Control():
             return f"Ошибка при отправке команды через Serial: {e}"
     else:
         return f"[Имитация] Порт {SERIAL_PORT} недоступен. Команда '{command.strip()}' отправлена в никуда."
-    
 
+# Дополнительная явная команда для движения вниз, если это необходимо для интерфейса
+def Arduino_Control_Down(steps: int = 300):
+    """Аналогичная команда для движения вниз"""
+    return Arduino_Control(direction="down", steps=steps)
 
 try:
-    # timeout=1 нужен, чтобы скрипт не зависал при чтении, если Arduino не ответит
     arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2) # Обязательная пауза, так как при открытии порта Arduino перезагружается
+    time.sleep(2) 
     print(f"✅ Успешное подключение к Arduino на порту {SERIAL_PORT}")
     listener_thread = threading.Thread(target=arduino_listener, daemon=True)
     listener_thread.start()
 except Exception as e:
     arduino = None
     print(f"⚠️ Не удалось подключиться к Arduino на порту {SERIAL_PORT}: {e}")
-    print("Код продолжит работать, но команды Serial будут имитироваться в лог.")
+    print("Код продолжил работать в режиме имитации.")
