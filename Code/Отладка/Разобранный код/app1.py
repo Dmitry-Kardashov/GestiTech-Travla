@@ -1,3 +1,4 @@
+import glob  # Добавьте в самый верх файла, если его нет
 import cv2
 import numpy as np
 import os
@@ -9,7 +10,7 @@ import gradio as gr
 
 import arduinoControl
 import camera
-
+CURRENT_GERBER_PATH = None
 css = """
 .no-buttons [class*="button"], 
 .no-buttons [id*="button"],
@@ -49,7 +50,13 @@ DEFAULT_CONFIG = {
 Input_skleika = 'pcb_pic'
 
 # Путь и имя итогового файла панорамы
-output_skleika = './PCB_Skleika.jpg'
+output_skleika = 'PCB_Skleika.jpg'
+
+INSPECTION_SHARED_STATE = {
+    "has_new_data": False,
+    "img_path": None,
+    "report_text": ""
+}
 # ==========================================
 # 🛠️ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ
 # ==========================================
@@ -335,23 +342,37 @@ def smart_inspect_pcb(gerber_active, pcb_active, img_pcb_aligned, min_defect_are
 # ==========================================
 
 
-
 def run_inspection(
     file_gbr, file_pcb_path, max_working_side, filter_d, 
     sigma_color, sigma_space, block_size, c_val, 
     noise_method, morph_size, min_noise_area, 
     min_defect_area, large_defect_area
 ):
-    # Проверяем, выбраны ли файлы пользователем
-    if file_gbr is None:
-        return None, "Ошибка: Пожалуйста, выберите Gerber файл."
-    if file_pcb_path is None:
-        return None, "Ошибка: Пожалуйста, выберите фотографию платы."
+    # Исправленное извлечение пути для Gerber
+    if file_gbr is not None:
+        if hasattr(file_gbr, 'name'):
+            gbr_path = file_gbr.name
+        elif isinstance(file_gbr, str):
+            gbr_path = file_gbr
+        else:
+            gbr_path = str(file_gbr)
+    else:
+        print("❌ Ошибка: Gerber-файл не передан.")
+        return None, "Ошибка: Gerber-файл не передан."
     
-    # Gradio сохраняет временные файлы. Получаем их абсолютные пути:
-    path_gbr = file_gbr.name
-    path_pcb = file_pcb_path
+    # Извлечение пути для фото платы (Gradio Image component может возвращать строку-путь или dict)
+    if file_pcb_path is not None:
+        if isinstance(file_pcb_path, str):
+            path_pcb = file_pcb_path
+        elif isinstance(file_pcb_path, dict) and 'name' in file_pcb_path:
+            path_pcb = file_pcb_path['name']
+        else:
+            path_pcb = str(file_pcb_path)
+    else:
+        print("❌ Ошибка: Фото платы не передано.")
+        return None, "Ошибка: Фото платы не передано."
         
+    path_gbr = gbr_path
     os.makedirs(DEFAULT_CONFIG["output_dir"], exist_ok=True)
     
     # Шаг 1: Конвертация Gerber в PNG
@@ -369,6 +390,9 @@ def run_inspection(
     # Шаг 2: Чтение изображений
     img_gerber = cv2.imread(DEFAULT_CONFIG["path_output"])
     img_pcb = cv2.imread(path_pcb)
+    
+    if img_gerber is None or img_pcb is None:
+        return None, "Ошибка чтения изображений с диска."
     
     # Шаг 3: Выравнивание разрешения
     img_gerber, img_pcb = unify_resolution(img_gerber, img_pcb, max_working_side)
@@ -413,6 +437,20 @@ def run_inspection(
     
     return output_visual_rgb, report_text
 
+def check_for_background_updates(current_img, current_report):
+    """Каждую секунду проверяет, появились ли новые данные от фонового анализа"""
+    global INSPECTION_SHARED_STATE
+    
+    if INSPECTION_SHARED_STATE["has_new_data"]:
+        # Сбрасываем триггер
+        INSPECTION_SHARED_STATE["has_new_data"] = False
+        print("🔄 Интерфейс Gradio обнаружил новые данные и обновляет UI!")
+        
+        # Возвращаем новые значения в компоненты
+        return INSPECTION_SHARED_STATE["img_path"], INSPECTION_SHARED_STATE["report_text"]
+    
+    # Если обновлений нет — возвращаем gr.update(), сигнализируя об отсутствии изменений
+    return gr.update(), gr.update()
 
 
 # Строим интерфейс Gradio
@@ -458,6 +496,32 @@ with gr.Blocks(title="Травилка") as demo:
                         label="Загрузить Gerber файл (.gbr)", 
                         file_count="single"
                     )
+                    gerber_path_state = gr.State(None)
+                    # Нам нужно обновлять этот путь каждый раз, когда пользователь выбирает файл в проводнике
+                    def update_gerber_path(file_obj):
+                        if file_obj is not None:
+                            return file_obj.name
+                        return None
+
+                    input_gbr_file.change(
+                        fn=update_gerber_path,
+                        inputs=[input_gbr_file],
+                        outputs=[gerber_path_state]
+                    )
+
+                    # Функция, которая сработает сразу при выборе файла в проводнике
+                    def on_gerber_change(file_obj):
+                        global CURRENT_GERBER_PATH
+                        if file_obj is not None:
+                            CURRENT_GERBER_PATH = file_obj.name
+                            print(f"📂 Gerber успешно загружен в систему. Путь: {CURRENT_GERBER_PATH}")
+                        else:
+                            CURRENT_GERBER_PATH = None
+                        return file_obj
+
+                    # Связываем компонент с функцией обновления
+                    input_gbr_file.change(fn=on_gerber_change, inputs=[input_gbr_file], outputs=[])
+
                     input_pcb_file = gr.Image(
                         label="Загрузить фото платы", 
                         type="filepath" # Передает путь к временному файлу
@@ -474,6 +538,7 @@ with gr.Blocks(title="Травилка") as demo:
                     result_image = gr.Image(label="Карта дефектов")
                     result_report = gr.Textbox(label="Отчет", lines=6)
 
+                
         # Вторая вкладка: Настройки
         with gr.TabItem("Настройки"):
             gr.Markdown("### Тонкая настройка алгоритмов обработки изображений")
@@ -504,6 +569,15 @@ with gr.Blocks(title="Травилка") as demo:
                     gr.Markdown("#### Порог площади дефектов")
                     cfg_min_defect_area = gr.Number(label="min_defect_area", value=DEFAULT_CONFIG["min_defect_area"], precision=0)
                     cfg_large_defect_area = gr.Number(label="large_defect_area (Критический порог)", value=DEFAULT_CONFIG["large_defect_area"], precision=0)
+
+    auto_refresh_timer = gr.Timer(value=1.0) # Будет срабатывать раз в 1.0 сек
+    
+    # Привязываем тиканье таймера к функции проверки
+    auto_refresh_timer.tick(
+        fn=check_for_background_updates,
+        inputs=[result_image, result_report],
+        outputs=[result_image, result_report]
+    )
 
     # Логика кнопок
     btn_start_work.click(
@@ -556,11 +630,12 @@ def stitch_all_from_folder():
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
     image_paths = []
     
-    # Собираем все файлы по маске расширений
+    # ИСПРАВЛЕНО: Правильный сбор файлов из папки
     for ext in extensions:
-        image_paths.extend(Input_skleika, ext)
+        search_path = os.path.join(Input_skleika, ext)
+        image_paths.extend(glob.glob(search_path))
         
-    # Сортируем файлы по имени (чтобы порядок гарантированно шел снизу вверх)
+    # Сортируем файлы по имени
     image_paths = sorted(image_paths)
     
     num_images = len(image_paths)
@@ -640,14 +715,113 @@ def stitch_all_from_folder():
         mask = (img_warped > 0)
         result[mask] = img_warped[mask]
 
+    # ... (весь твой код склейки гомографии)
+
     # Создаем папку для сохранения, если её нет
     output_dir = os.path.dirname(output_skleika)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # Сохраняем результат
     cv2.imwrite(output_skleika, result)
     print(f"Успех! Панорама сохранена здесь: {output_skleika}")
+    
+    # Запускаем инспекцию в потоке, которая выставит нужные флаги для таймера
+    trigger_auto_inspection()
+    
+    return True
+
+    # ==========================================================
+    # 🔄 АВТОМАТИЧЕСКИЙ ЗАПУСК ПОСЛЕДУЮЩЕЙ ОБРАБОТКИ ДЛЯ GRADIO
+    # ==========================================================
+    # Получаем доступ к компонентам интерфейса из глобальной области видимости
+    global input_gbr_file, result_image, result_report
+    
+    # Проверяем, загрузил ли пользователь Gerber-файл в интерфейсе
+    current_gbr = input_gbr_file.value
+    if current_gbr is None:
+        print("⚠️ Склейка завершена, но анализ не запущен: в интерфейсе не выбран Gerber файл!")
+        return
+
+    print("🔍 Запуск дефектоскопии по полученной панораме...")
+    
+    # Прямо из кода вызываем инспекцию с текущими настройками из ползунков интерфейса
+    res_img, report_txt = run_inspection(
+        file_gbr=input_gbr_file, # Передаем объект файла из Gradio
+        file_pcb_path=output_skleika, # Передаем путь к только что сохраненной панораме
+        max_working_side=cfg_max_working_side.value,
+        filter_d=cfg_filter_d.value,
+        sigma_color=cfg_sigma_color.value,
+        sigma_space=cfg_sigma_space.value,
+        block_size=cfg_block_size.value,
+        c_val=cfg_c_val.value,
+        noise_method=cfg_noise_method.value,
+        morph_size=cfg_morph_size.value,
+        min_noise_area=cfg_min_noise_area.value,
+        min_defect_area=cfg_min_defect_area.value,
+        large_defect_area=cfg_large_defect_area.value
+    )
+    
+    # Обновляем элементы веб-интерфейса Gradio "на лету" из фонового потока
+    result_image.value = res_img
+    result_report.value = report_txt
+    print("📈 Интерфейс успешно обновлен результатами анализа!")
+
+def trigger_auto_inspection():
+    """Эта функция вызывается из фонового потока Arduino ПОСЛЕ успешной склейки"""
+    global CURRENT_GERBER_PATH, INSPECTION_SHARED_STATE
+    
+    if CURRENT_GERBER_PATH is None:
+        print("❌ Критическая ошибка: Физический путь к Gerber файлу пуст!")
+        return
+        
+    print(f"🚀 Запуск анализа. Gerber: {CURRENT_GERBER_PATH}, Панорама: {output_skleika}")
+    
+    try:
+        # 1. ЗАПУСКАЕМ ИНСПЕКЦИЮ
+        res_img_rgb, report_txt = run_inspection(
+            CURRENT_GERBER_PATH,
+            output_skleika,
+            int(cfg_max_working_side.value) if hasattr(cfg_max_working_side, 'value') else 2200,
+            int(cfg_filter_d.value) if hasattr(cfg_filter_d, 'value') else 9,
+            int(cfg_sigma_color.value) if hasattr(cfg_sigma_color, 'value') else 75,
+            int(cfg_sigma_space.value) if hasattr(cfg_sigma_space, 'value') else 75,
+            int(cfg_block_size.value) if hasattr(cfg_block_size, 'value') else 59,
+            int(cfg_c_val.value) if hasattr(cfg_c_val, 'value') else -14,
+            str(cfg_noise_method.value) if hasattr(cfg_noise_method, 'value') else "Морфологическое открытие (Быстро)",
+            int(cfg_morph_size.value) if hasattr(cfg_morph_size, 'value') else 4,
+            int(cfg_min_noise_area.value) if hasattr(cfg_min_noise_area, 'value') else 250,
+            int(cfg_min_defect_area.value) if hasattr(cfg_min_defect_area, 'value') else 200,
+            int(cfg_large_defect_area.value) if hasattr(cfg_large_defect_area, 'value') else 800
+        )
+        
+        # 2. ГАРАНТИРОВАННОЕ СОХРАНЕНИЕ НА ДИСК
+        debug_dir = "./debuging"
+        if not os.path.exists(debug_dir):
+            os.makedirs(debug_dir)
+            
+        debug_img_path = os.path.join(debug_dir, "inspection_result.png")
+        debug_txt_path = os.path.join(debug_dir, "inspection_report.txt")
+        
+        if res_img_rgb is not None:
+            res_img_bgr = cv2.cvtColor(res_img_rgb, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(debug_img_path, res_img_bgr)
+            print(f"💾 Изображение анализа успешно сохранено в: {debug_img_path}")
+        else:
+            print("⚠️ Внимание: Матрица изображения пуста.")
+            return
+            
+        with open(debug_txt_path, "w", encoding="utf-8") as f:
+            f.write(report_txt)
+        print(f"💾 Текстовый отчет успешно сохранен в: {debug_txt_path}")
+
+        # 3. ПЕРЕДАЕМ ДАННЫЕ ДЛЯ GRADIO ТАЙМЕРА
+        INSPECTION_SHARED_STATE["img_path"] = debug_img_path
+        INSPECTION_SHARED_STATE["report_text"] = report_txt
+        INSPECTION_SHARED_STATE["has_new_data"] = True  # Сигнализируем интерфейсу
+        print("📈 Данные подготовлены для отображения в Gradio.")
+
+    except Exception as e:
+        print(f"❌ Ошибка внутри триггера автоматического анализа: {e}")
 
 def main():
     demo.launch(share=False)
