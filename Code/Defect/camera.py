@@ -9,6 +9,10 @@ CAP_W, CAP_H = 1920, 1080
 DISPLAY_WIDTH = 1280        
 FOCUS_START = 100           
 
+# Камера установлена вверх ногами -> переворачиваем каждый кадр сразу после захвата,
+# до того как он попадет в current_live_frame, на предпросмотр и на снимки.
+ROTATE_180 = True
+
 pcb_dir = "pcb_pic"
 
 def open_camera():
@@ -60,6 +64,9 @@ def CameraInit():
         if not ret:
             print("Ошибка: нет кадра.")
             break
+
+        if ROTATE_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
 
         global current_live_frame
         current_live_frame = frame.copy()

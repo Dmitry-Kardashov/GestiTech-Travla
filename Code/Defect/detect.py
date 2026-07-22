@@ -60,6 +60,62 @@ def _resize_to_max_side(img, max_side):
     new_w, new_h = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+def _is_landscape(img) -> bool:
+    h, w = img.shape[:2]
+    return w >= h
+
+def auto_rotate_to_match(img_gerber, img_pcb):
+    """
+    Снимок платы (особенно склеенная панорама) может оказаться повернут
+    относительно Gerber-файла на 90/180/270 градусов - в зависимости от того,
+    как плата была установлена и в какую сторону шла склейка кадров.
+    Приводим img_pcb к той же ориентации (альбомная/книжная), что и img_gerber,
+    а если это не снимает неоднозначность (90 vs 270, 0 vs 180 - у них
+    одинаковый аспект), выбираем вариант с наибольшим числом ORB-совпадений
+    с Gerber-файлом - перевернутый вариант почти всегда даст заметно меньше
+    хороших совпадений.
+    Возвращает (повернутое_изображение, угол_поворота_в_градусах).
+    """
+    gerber_landscape = _is_landscape(img_gerber)
+
+    candidates = {
+        0: img_pcb,
+        90: cv2.rotate(img_pcb, cv2.ROTATE_90_CLOCKWISE),
+        180: cv2.rotate(img_pcb, cv2.ROTATE_180),
+        270: cv2.rotate(img_pcb, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    }
+
+    # 1. Оставляем только повороты, дающие нужную (альбомную/книжную) ориентацию.
+    same_orientation = [r for r in candidates if _is_landscape(candidates[r]) == gerber_landscape]
+    if not same_orientation:
+        same_orientation = list(candidates.keys())  # подстраховка, если аспекты совсем не совпадают
+
+    if len(same_orientation) == 1:
+        rot = same_orientation[0]
+        return candidates[rot], rot
+
+    # 2. Среди оставшихся кандидатов (обычно пара 0/180 или 90/270) выбираем
+    #    по количеству хороших ORB-совпадений с Gerber-файлом.
+    orb = cv2.ORB_create(2000)
+    gray_gerber = cv2.cvtColor(img_gerber, cv2.COLOR_BGR2GRAY)
+    kg, dg = orb.detectAndCompute(gray_gerber, None)
+
+    best_rot, best_score = same_orientation[0], -1
+    for rot in same_orientation:
+        gray_pcb = cv2.cvtColor(candidates[rot], cv2.COLOR_BGR2GRAY)
+        kp, dp = orb.detectAndCompute(gray_pcb, None)
+        if dg is None or dp is None or len(kp) < 10 or len(kg) < 10:
+            continue
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(dg, dp)
+        good = [m for m in matches if m.distance < 50]
+        score = len(good)
+        if score > best_score:
+            best_score = score
+            best_rot = rot
+
+    return candidates[best_rot], best_rot
+
 def unify_resolution(img_gerber, img_pcb, max_working_side=None):
     gerber_side = max(img_gerber.shape[:2])
     pcb_side = max(img_pcb.shape[:2])
@@ -306,6 +362,16 @@ def smart_inspect_pcb(gerber_active, pcb_active, img_pcb_aligned, min_defect_are
 
     return output_visual, stats
 
+def _debug_save(img, filename: str, output_dir: str):
+    """Сохраняет промежуточный кадр в папку отладки и пишет об этом в лог."""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, filename)
+        cv2.imwrite(path, img)
+        print(f"[debug] Промежуточный кадр сохранен: {path}")
+    except Exception as e:
+        print(f"[debug] Не удалось сохранить промежуточный кадр {filename}: {e}")
+
 def run_inspection(
     file_gbr, file_pcb_path, max_working_side, filter_d, 
     sigma_color, sigma_space, block_size, c_val, 
@@ -335,7 +401,10 @@ def run_inspection(
         return None, "Ошибка: Фото платы не передано."
         
     os.makedirs(DEFAULT_CONFIG["output_dir"], exist_ok=True)
-    
+    debug_dir = DEFAULT_CONFIG["output_dir"]
+    print(f"🔍 Запуск анализа. Gerber: {gbr_path}, Фото платы: {path_pcb}")
+    print(f"[debug] Промежуточные кадры будут сохраняться в: {os.path.abspath(debug_dir)}")
+
     try:
         gerber_to_png(
             input_path=gbr_path,
@@ -345,38 +414,74 @@ def run_inspection(
             transparent_background=TRANSPARENT
         )
     except Exception as e:
+        print(f"Ошибка при обработке Gerber: {e}")
         return None, f"Ошибка при обработке Gerber: {str(e)}"
 
     img_gerber = cv2.imread(DEFAULT_CONFIG["path_output"])
     img_pcb = cv2.imread(path_pcb)
     
     if img_gerber is None or img_pcb is None:
+        print("Ошибка чтения изображений с диска.")
         return None, "Ошибка чтения изображений с диска."
-    
+
+    _debug_save(img_gerber, "01_gerber_raw.jpg", debug_dir)
+    _debug_save(img_pcb, "02_pcb_raw.jpg", debug_dir)
+
+    # Снимок платы (особенно склеенная панорама) может прийти повернутым
+    # на 90/180/270 градусов относительно Gerber-файла - приводим к нужной
+    # ориентации до дальнейшего выравнивания.
+    print("[debug] Проверка ориентации фото платы относительно Gerber-файла...")
+    img_pcb, applied_rotation = auto_rotate_to_match(img_gerber, img_pcb)
+    if applied_rotation != 0:
+        print(f"Обнаружен поворот фото платы на {applied_rotation}° - скорректировано автоматически.")
+        _debug_save(img_pcb, "03_pcb_rotated.jpg", debug_dir)
+    else:
+        print("[debug] Поворот фото платы не требуется.")
+
+    print("[debug] Приведение изображений к единому разрешению...")
     img_gerber, img_pcb = unify_resolution(img_gerber, img_pcb, max_working_side)
-    
+    print(f"[debug] Рабочее разрешение: Gerber {img_gerber.shape[1]}x{img_gerber.shape[0]}, "
+          f"PCB {img_pcb.shape[1]}x{img_pcb.shape[0]}")
+    _debug_save(img_gerber, "04_gerber_resized.jpg", debug_dir)
+    _debug_save(img_pcb, "05_pcb_resized.jpg", debug_dir)
+
+    print("[debug] Грубое совмещение платы с Gerber-файлом (поиск контура платы)...")
     img_pcb_aligned_rough = align_images_orb(img_gerber, img_pcb)
+    _debug_save(img_pcb_aligned_rough, "06_pcb_aligned_rough.jpg", debug_dir)
+
+    print("[debug] Точное совмещение по ключевым точкам (SIFT/FLANN)...")
     img_pcb_aligned = refine_registration_orb(img_gerber, img_pcb_aligned_rough)
-    
-    verify_alignment(img_gerber, img_pcb_aligned, DEFAULT_CONFIG["output_dir"])
-    
+    _debug_save(img_pcb_aligned, "07_pcb_aligned_refined.jpg", debug_dir)
+
+    match_ratio = verify_alignment(img_gerber, img_pcb_aligned, debug_dir)
+    print(f"[debug] Качество совмещения (match_ratio): {match_ratio:.3f} "
+          f"(см. также {os.path.join(debug_dir, 'step2b_alignment_check.jpg')})")
+
+    print("[debug] Бинаризация Gerber-файла и фото платы...")
     gerber_gray = cv2.cvtColor(img_gerber, cv2.COLOR_BGR2GRAY)
     _, gerber_bin = cv2.threshold(gerber_gray, 127, 255, cv2.THRESH_BINARY)
-    
+    _debug_save(gerber_bin, "08_gerber_binary.jpg", debug_dir)
+
     pcb_bin = binarize_pcb_advanced(
         img_pcb_aligned, filter_d, sigma_color, sigma_space, 
         block_size, c_val, noise_method, morph_size, min_noise_area
     )
+    _debug_save(pcb_bin, "09_pcb_binary.jpg", debug_dir)
     
     kernel_roi = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     roi_mask = cv2.dilate(gerber_bin, kernel_roi)
     gerber_active = cv2.bitwise_and(gerber_bin, roi_mask)
     pcb_active = cv2.bitwise_and(pcb_bin, roi_mask)
-    
+    _debug_save(gerber_active, "10_gerber_active.jpg", debug_dir)
+    _debug_save(pcb_active, "11_pcb_active.jpg", debug_dir)
+
+    print("[debug] Поиск дефектов (обрывы/замыкания)...")
     output_visual, stats = smart_inspect_pcb(
         gerber_active, pcb_active, img_pcb_aligned, min_defect_area, large_defect_area
     )
-    
+    _debug_save(output_visual, "12_output_visual.jpg", debug_dir)
+    print(f"[debug] Найдено дефектов: {stats}")
+
     output_visual_rgb = cv2.cvtColor(output_visual, cv2.COLOR_BGR2RGB)
     
     report_text = (
@@ -386,6 +491,7 @@ def run_inspection(
         f"Критических замыканий: {stats['critical_shorts']}\n"
         f"Незначительных наплывов меди: {stats['minor_excess']}"
     )
+    print("✅ Анализ завершен.")
     
     return output_visual_rgb, report_text
 
@@ -482,8 +588,12 @@ def stitch_all_from_folder(web_module_ref=None):
 
     cv2.imwrite(output_skleika, result)
     print(f"Успех! Панорама сохранена здесь: {output_skleika}")
-    
+
     if web_module_ref and hasattr(web_module_ref, 'trigger_auto_inspection'):
+        print("Панорама готова, вызываю web.trigger_auto_inspection() для автоматического поиска дефектов...")
         web_module_ref.trigger_auto_inspection()
-    
+    else:
+        print("⚠️ web_module_ref не передан (или в нем нет trigger_auto_inspection) - "
+              "автоматический поиск дефектов после склейки НЕ запущен.")
+
     return True
