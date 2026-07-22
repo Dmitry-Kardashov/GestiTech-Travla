@@ -166,6 +166,7 @@ with gr.Blocks(title="Травилка") as demo:
                         btn_lower_board = gr.Button("Опустить плату", variant="secondary")
                     with gr.Row():
                         btn_calibrate = gr.Button("Калибровка двигателей", variant="secondary")
+                        btn_cycle_move = gr.Button("Демонстрация", variant="secondary")
                         
                     status_output = gr.Textbox(label="Статус системы / Лог пустой функции", placeholder="Здесь будет лог...")
                     
@@ -232,6 +233,7 @@ with gr.Blocks(title="Травилка") as demo:
     btn_lower_board.click(fn=arduinoControl.Lower_Board, inputs=[], outputs=[status_output])
     btn_calibrate.click(fn=arduinoControl.Motor_Calibrate, inputs=[], outputs=[status_output])
     btn_open_cam.click(fn=camera.CameraInit, inputs=[], outputs=[])
+    btn_cycle_move.click(fn=arduinoControl.toggle_cyclic_movement, inputs=[], outputs=[status_output])
     
     btn_run_main.click(
         fn=detect.run_inspection,

@@ -7,9 +7,13 @@ from pygerber.gerberx3.api.v2 import GerberFile, ColorScheme, PixelFormatEnum
 from pygerber.common.rgba import RGBA
 
 # Глобальные конфигурации по умолчанию
-DPMM = 40                      
-TRACK_COLOR = "#FFFFFF"        
-TRANSPARENT = True             
+# DPMM снижен с 40 до 12: раньше Gerber рендерился в 8000x6000 (48 Мп) и тут же
+# ужимался до max_working_side=2200 - гигантский рендер выбрасывался впустую и
+# тормозил загрузку. Теперь рендерим сразу в рабочем разрешении (в разы быстрее,
+# качество не теряется). Реальный dpmm ещё и подбирается адаптивно по размеру платы.
+DPMM = 12
+TRACK_COLOR = "#FFFFFF"
+TRANSPARENT = True
 
 DEFAULT_CONFIG = {
     "output_dir": "debugging_inspection",      
@@ -35,7 +39,25 @@ def hex_to_rgba(hex_color: str, alpha: int = 255) -> RGBA:
     r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
     return RGBA(r=r, g=g, b=b, a=alpha)
 
-def gerber_to_png(input_path: str, output_path: str, dpmm: int, track_color: str, transparent_background: bool) -> None:
+def _pick_dpmm(parsed, target_long_side, dpmm_default, dpmm_min=6, dpmm_max=40):
+    """
+    Подбирает dpmm так, чтобы длинная сторона отрендеренного PNG была ~target_long_side.
+    Габариты платы (мм) берём из parsed.get_info(); если не вышло - dpmm_default.
+    Смысл: рендерить сразу в рабочем разрешении, а не в 48 Мп с последующим ужатием.
+    """
+    try:
+        info = parsed.get_info()
+        long_side_mm = float(max(info.width_mm, info.height_mm))
+        if long_side_mm > 0:
+            dpmm = target_long_side / long_side_mm
+            return int(max(dpmm_min, min(dpmm_max, round(dpmm))))
+    except Exception as e:
+        print(f"[gerber] Не удалось определить размер платы ({e}), dpmm={dpmm_default}.")
+    return dpmm_default
+
+
+def gerber_to_png(input_path: str, output_path: str, dpmm: int, track_color: str,
+                  transparent_background: bool, target_long_side: int = None) -> None:
     color_scheme = ColorScheme(
         solid_color=hex_to_rgba(track_color, alpha=255),
         solid_region_color=hex_to_rgba(track_color, alpha=255),
@@ -44,6 +66,9 @@ def gerber_to_png(input_path: str, output_path: str, dpmm: int, track_color: str
         background_color=RGBA(r=0, g=0, b=0, a=0 if transparent_background else 255),
     )
     parsed = GerberFile.from_file(input_path).parse()
+    if target_long_side:
+        dpmm = _pick_dpmm(parsed, target_long_side, dpmm)
+        print(f"[gerber] Рабочий dpmm={dpmm} (цель ~{target_long_side}px по длинной стороне).")
     parsed.render_raster(
         output_path,
         color_scheme=color_scheme,
@@ -203,7 +228,9 @@ def _edge_map(img):
 
 def refine_registration_orb(img_gerber, img_pcb_aligned):
     gh, gw = img_gerber.shape[:2]
-    sift = cv2.SIFT_create(nfeatures=10000)
+    # nfeatures 10000 -> 3000: на рабочем разрешении ~2200px 3000 точек с запасом
+    # хватает для RANSAC-гомографии, а SIFT в разы легче для Raspberry Pi 5.
+    sift = cv2.SIFT_create(nfeatures=3000)
     gray_gerber = cv2.cvtColor(img_gerber, cv2.COLOR_BGR2GRAY)
     gray_pcb = cv2.cvtColor(img_pcb_aligned, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
@@ -411,7 +438,8 @@ def run_inspection(
             output_path=DEFAULT_CONFIG["path_output"],
             dpmm=DPMM,
             track_color=TRACK_COLOR,
-            transparent_background=TRANSPARENT
+            transparent_background=TRANSPARENT,
+            target_long_side=int(max_working_side),
         )
     except Exception as e:
         print(f"Ошибка при обработке Gerber: {e}")
@@ -495,36 +523,74 @@ def run_inspection(
     
     return output_visual_rgb, report_text
 
-def get_homography(img_src, img_dst):
-    sift = cv2.SIFT_create()
-    kp_src, des_src = sift.detectAndCompute(img_src, None)
-    kp_dst, des_dst = sift.detectAndCompute(img_dst, None)
-    
-    bf = cv2.BFMatcher()
-    matches = bf.knnMatch(des_src, des_dst, k=2)
-    
+# ============================ СКЛЕЙКА ПАНОРАМЫ ============================
+# Плата снимается на просветном столе, пока мотор поднимает её равномерными
+# шагами: камера неподвижна, кадры отличаются в основном ВЕРТИКАЛЬНЫМ сдвигом с
+# большим перекрытием. Поэтому вместо полной перспективной гомографии (она
+# накапливает ошибку и «заваливает» панораму) оцениваем частичное аффинное
+# преобразование (сдвиг+поворот+масштаб) между соседними кадрами - это устойчиво
+# и быстро (важно для Raspberry Pi 5).
+
+# Переиспользуемые объекты (не создаём в цикле - экономия на Pi).
+_STITCH_ORB = cv2.ORB_create(4000)
+_STITCH_BF = cv2.BFMatcher(cv2.NORM_HAMMING)
+_STITCH_CLAHE = cv2.createCLAHE(2.0, (8, 8))
+
+# Минимум inliers, чтобы считать пару кадров надёжно совмещённой. Если меньше -
+# скорее всего это граница между разными прогонами (плата «прыгнула») - обрываем.
+_STITCH_MIN_INLIERS = 15
+
+
+def _stitch_gray(img):
+    return _STITCH_CLAHE.apply(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+
+def _estimate_pair_transform(img_a, img_b):
+    """
+    Оценивает аффинное преобразование, переводящее точки img_b в систему img_a.
+    Возвращает (M 2x3, число_inliers) или (None, 0).
+    """
+    ka, da = _STITCH_ORB.detectAndCompute(_stitch_gray(img_a), None)
+    kb, db = _STITCH_ORB.detectAndCompute(_stitch_gray(img_b), None)
+    if da is None or db is None or len(ka) < 4 or len(kb) < 4:
+        return None, 0
+
     good = []
-    for m, n in matches:
-        if m.distance < 0.7 * n.distance:
+    for pair in _STITCH_BF.knnMatch(db, da, k=2):
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance < 0.75 * n.distance:
             good.append(m)
-            
-    if len(good) < 4:
-        raise ValueError("Недостаточно общих точек между соседними кадрами!")
-        
-    src_pts = np.float32([kp_src[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp_dst[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    
-    H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    return H
+    if len(good) < 10:
+        return None, 0
+
+    src = np.float32([kb[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([ka[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    M, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC,
+                                             ransacReprojThreshold=5.0)
+    if M is None or inliers is None:
+        return None, 0
+    return M, int(inliers.sum())
+
+
+def _autocrop_nonblack(img):
+    """Обрезает пустые (чёрные) поля канваса по bounding box содержимого."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.where(gray > 0)
+    if len(xs) == 0:
+        return img
+    x0, x1 = xs.min(), xs.max() + 1
+    y0, y1 = ys.min(), ys.max() + 1
+    return img[y0:y1, x0:x1]
+
 
 def stitch_all_from_folder(web_module_ref=None):
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
     image_paths = []
-    
     for ext in extensions:
-        search_path = os.path.join(Input_skleika, ext)
-        image_paths.extend(glob.glob(search_path))
-        
+        image_paths.extend(glob.glob(os.path.join(Input_skleika, ext)))
+
     image_paths = sorted(image_paths)
     num_images = len(image_paths)
     if num_images < 2:
@@ -533,61 +599,69 @@ def stitch_all_from_folder(web_module_ref=None):
 
     print(f"Успешно найдено {num_images} изображений в папке '{Input_skleika}'")
     images = [cv2.imread(path) for path in image_paths]
-    
-    base_idx = num_images // 2
-    H_neighbors = {}
-    for i in range(num_images - 1):
-        H_neighbors[i] = get_homography(images[i], images[i+1])
 
-    homographies = [None] * num_images
-    homographies[base_idx] = np.eye(3)
+    # 1. Цепочка абсолютных аффинных трансформов от 1-го кадра.
+    #    abs_M[i] переводит кадр i в систему координат кадра 0.
+    abs_M = [np.eye(2, 3, dtype=np.float32)]
+    for i in range(1, num_images):
+        rel, ninl = _estimate_pair_transform(images[i - 1], images[i])
+        if rel is None or ninl < _STITCH_MIN_INLIERS:
+            # Ненадёжная пара - вероятно, граница между прогонами. Обрываем серию,
+            # чтобы не «приклеивать» мусор (страховка: папка и так чистится перед прогоном).
+            print(f"[склейка] Пара {i-1}->{i}: мало inliers ({ninl}) - останавливаю склейку "
+                  f"на {i} кадрах (похоже на границу прогона).")
+            break
+        print(f"[склейка] Пара {i-1}->{i}: inliers={ninl}, dy={rel[1,2]:.0f}px")
+        comp = np.vstack([abs_M[i - 1], [0, 0, 1]]) @ np.vstack([rel, [0, 0, 1]])
+        abs_M.append(comp[:2, :].astype(np.float32))
 
-    for i in range(base_idx - 1, -1, -1):
-        homographies[i] = np.dot(homographies[i+1], H_neighbors[i])
+    used = len(abs_M)
+    images = images[:used]
+    if used < 2:
+        print("[склейка] Надёжно совместился только 1 кадр - панорама не построена.")
+        return False
 
-    for i in range(base_idx + 1, num_images):
-        H_inv = np.linalg.inv(H_neighbors[i-1])
-        homographies[i] = np.dot(homographies[i-1], H_inv)
-
-    all_corners = []
+    # 2. Габариты канваса по углам всех кадров.
+    all_pts = []
     for i, img in enumerate(images):
         h, w = img.shape[:2]
-        corners = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
-        transformed_corners = cv2.perspectiveTransform(corners, homographies[i])
-        all_corners.append(transformed_corners)
+        corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+        all_pts.append(cv2.transform(corners, abs_M[i]))
+    all_pts = np.concatenate(all_pts, axis=0)
+    x_min, y_min = all_pts.min(axis=0).ravel()
+    x_max, y_max = all_pts.max(axis=0).ravel()
+    canvas_w = int(np.ceil(x_max - x_min))
+    canvas_h = int(np.ceil(y_max - y_min))
 
-    all_corners = np.concatenate(all_corners, axis=0)
-    [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
-    [x_max, y_max] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
-
-    translation_dist = [-x_min, -y_min]
-    H_translation = np.array([[1, 0, translation_dist[0]], 
-                              [0, 1, translation_dist[1]], 
-                              [0, 0, 1]])
-
-    canvas_width = x_max - x_min
-    canvas_height = y_max - y_min
-
-    warped_images = []
+    # 3. Композитинг с лёгким линейным пером в зоне перекрытия (сглаживает шов).
+    result = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+    weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
     for i, img in enumerate(images):
-        H_translated = np.dot(H_translation, homographies[i])
-        warped = cv2.warpPerspective(img, H_translated, (canvas_width, canvas_height))
-        warped_images.append(warped)
+        M = abs_M[i].copy()
+        M[0, 2] -= x_min
+        M[1, 2] -= y_min
+        warped = cv2.warpAffine(img, M, (canvas_w, canvas_h)).astype(np.float32)
+        # Вес кадра: 1 внутри, плавно спадает к краям (feather по расстоянию до края).
+        h, w = img.shape[:2]
+        wmask = np.ones((h, w), np.float32)
+        cv2.rectangle(wmask, (0, 0), (w - 1, h - 1), 0.0, 1)
+        wmask = cv2.distanceTransform((wmask > 0).astype(np.uint8) * 255, cv2.DIST_L2, 3)
+        wmask = np.clip(wmask / 40.0, 0.05, 1.0)
+        wwarp = cv2.warpAffine(wmask, M, (canvas_w, canvas_h))
+        result += warped * wwarp[..., None]
+        weight += wwarp
+    nz = weight > 1e-6
+    result[nz] /= weight[nz][..., None]
+    result = np.clip(result, 0, 255).astype(np.uint8)
 
-    result = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
-    render_order = sorted(range(num_images), key=lambda x: abs(x - base_idx), reverse=True)
-
-    for idx in render_order:
-        img_warped = warped_images[idx]
-        mask = (img_warped > 0)
-        result[mask] = img_warped[mask]
+    # 4. Обрезка пустых полей канваса.
+    result = _autocrop_nonblack(result)
 
     output_dir = os.path.dirname(output_skleika)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
     cv2.imwrite(output_skleika, result)
-    print(f"Успех! Панорама сохранена здесь: {output_skleika}")
+    print(f"Успех! Панорама {result.shape[1]}x{result.shape[0]} сохранена здесь: {output_skleika}")
 
     if web_module_ref and hasattr(web_module_ref, 'trigger_auto_inspection'):
         print("Панорама готова, вызываю web.trigger_auto_inspection() для автоматического поиска дефектов...")

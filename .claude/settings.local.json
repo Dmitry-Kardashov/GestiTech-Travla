@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('detect.py'\\).read\\(\\)\\); print\\('detect.py syntax OK'\\)\")",
+      "Bash(mkdir -p /tmp/run1)",
+      "Bash(cp pcb_pic/1.jpg pcb_pic/2.jpg pcb_pic/3.jpg pcb_pic/4.jpg /tmp/run1/)",
+      "Bash(mkdir -p _clr/pcb_pic)",
+      "Bash(touch _clr/pcb_pic/1.jpg _clr/pcb_pic/2.png _clr/pcb_pic/keep.txt)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

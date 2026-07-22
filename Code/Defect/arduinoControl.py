@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 import threading
-import serial  
+import serial
 import time
+import os
+import glob
 import camera
 import sys
 
@@ -19,7 +21,22 @@ last_arduino_message = "Пока нет команд от Arduino"
 # Последовательность абсолютных позиций (ABS_MOVE), которые нужно пройти
 # одну за другой после нажатия "Начать работу". После каждой позиции
 # ждем "motor:step" от Arduino, делаем снимок и отправляем следующую позицию.
-ABS_MOVE_POSITIONS = [3000, 4000, 5000, 5200]   # значения по умолчанию
+#
+# ВАЖНО: позиции должны идти РАВНОМЕРНЫМ шагом - так соседние кадры имеют
+# одинаковое перекрытие, и склейка панорамы работает устойчиво. Раньше было
+# [3000,4000,5000,5200] (последний шаг 200 ед. почти не двигал плату, покрытие
+# было неполным). Теперь список генерируется generate_positions(): POS_COUNT
+# равномерных кадров в диапазоне POS_START..POS_END.
+# Чтобы изменить покрытие - меняйте POS_COUNT или поле «Позиции ABS_MOVE» в Gradio.
+POS_START, POS_END, POS_COUNT = 3000, 5200, 6
+
+def generate_positions(start, end, count):
+    """Равномерно распределяет `count` позиций от start до end (включительно)."""
+    count = max(2, int(count))
+    step = (end - start) / (count - 1)
+    return [int(round(start + step * i)) for i in range(count)]
+
+ABS_MOVE_POSITIONS = generate_positions(POS_START, POS_END, POS_COUNT)  # значения по умолчанию
 current_step_index = 0        # Индекс текущей позиции в ABS_MOVE_POSITIONS
 
 # Небольшая пауза перед снимком: мотор уже остановился, но плата по инерции
@@ -211,8 +228,87 @@ def Start_Work_Routine(positions=None):
             ABS_MOVE_POSITIONS = list(positions)
 
     current_step_index = 0  # Сбрасываем индекс перед запуском
+
+    # КЛЮЧЕВОЙ ФИКС: очищаем папку снимков перед новым прогоном. Раньше кадры
+    # накапливались между запусками, и склейка пыталась собрать панораму из
+    # снимков РАЗНЫХ прогонов - получался мусор (плата «прыгала» вверх на новом
+    # прогоне, гомография ломалась). Теперь каждый прогон стартует с чистой папки.
+    _clear_snapshots()
+
     print(f"Запуск рабочего цикла. Позиции ABS_MOVE: {ABS_MOVE_POSITIONS}")
     return Arduino_Move_Abs(ABS_MOVE_POSITIONS[0])
 
+
+def _clear_snapshots():
+    """Удаляет старые снимки из папки camera.pcb_dir (только файлы-картинки)."""
+    pcb_dir = getattr(camera, 'pcb_dir', 'pcb_pic')
+    if not os.path.isdir(pcb_dir):
+        return
+    removed = 0
+    for ext in ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG'):
+        for path in glob.glob(os.path.join(pcb_dir, ext)):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as e:
+                print(f"Не удалось удалить старый снимок {path}: {e}")
+    print(f"Папка снимков '{pcb_dir}' очищена перед прогоном (удалено файлов: {removed}).")
+
+
 listener_thread = threading.Thread(target=arduino_listener, daemon=True)
 listener_thread.start()
+
+
+# --- Циклическое движение (0 -> 5000 -> 0) ---
+is_cycling = False
+cycle_thread = None
+
+def cycle_loop():
+    """Фоновый цикл для перемещения мотора 0 -> 5000 -> 0"""
+    global is_cycling
+    print("🔄 Запущен цикл перемещения моторов (0 -> 5000 -> 0)...")
+    
+    while is_cycling:
+        # Движение вверх до 5000
+        print("Цикл: Движение к координате 5000...")
+        Arduino_Move_Abs(4900)
+        
+        # Ждем завершения/паузу между циклами (проверяем флаг каждые 0.5 сек)
+        for _ in range(20):  # Суммарно ~10 секунд ожидания
+            if not is_cycling:
+                break
+            time.sleep(0.5)
+            
+        if not is_cycling:
+            break
+
+        # Движение вниз к 0
+        print("Цикл: Движение к координате 0...")
+        Arduino_Move_Abs(0)
+        
+        for _ in range(20):
+            if not is_cycling:
+                break
+            time.sleep(0.5)
+
+    print("🛑 Циклическое движение остановлено.")
+
+def toggle_cyclic_movement():
+    """Запускает или останавливает циклическое движение"""
+    global is_cycling, cycle_thread
+    
+    if is_cycling:
+        is_cycling = False
+        return "Циклическое движение останавливается..."
+    else:
+        is_cycling = True
+        cycle_thread = threading.Thread(target=cycle_loop, daemon=True)
+        cycle_thread.start()
+        return "Запущено циклическое движение (0 - 5000)."
+    
+def Stop_Motor():
+    """Отправка команды экстренной/ручной остановки мотора"""
+    global current_step_index, is_cycling
+    is_cycling = False  # Останавливаем циклическое движение, если оно было запущено
+    current_step_index = 0
+    return send_raw_command("move:stop\n")
