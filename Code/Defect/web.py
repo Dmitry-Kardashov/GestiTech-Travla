@@ -140,7 +140,7 @@ def trigger_auto_inspection():
 # Построение интерфейса
 with gr.Blocks(title="Травилка") as demo:
     with gr.Row():
-        gr.Markdown("# Система определения печатных плат при травлении")
+        gr.Markdown("# Система определения дефектов печатных плат при травлении")
         gr.Image(value="Web/Логотип_black.svg", show_label=False, container=False, height=80, interactive=False, elem_classes="no-buttons", buttons=[])
         gr.Image(value="Web/БВ Лого.svg", show_label=False, container=False, height=80, interactive=False, elem_classes="no-buttons", buttons=[])
 
@@ -251,7 +251,7 @@ def main():
     # поэтому строка camera.CameraInit() после него раньше никогда не
     # выполнялась (мертвый код). Камера уже открывается по кнопке
     # "Открыть камеру" (btn_open_cam) - отдельный вызов здесь не нужен.
-    demo.launch(share=False, css=css)
+    demo.launch(share=True, server_name="0.0.0.0", server_port=7860, css=css)
 
 if __name__ == "__main__":
     main()

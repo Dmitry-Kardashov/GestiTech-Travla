@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import os
+import time
 
 CALIB = "camera_calibration1.npz"   # файл калибровки (None -> без коррекции дисторсии)
 current_live_frame = None           # Сюда OpenCV будет дублировать кадры
@@ -9,10 +10,7 @@ CAP_W, CAP_H = 1920, 1080
 DISPLAY_WIDTH = 1280        
 FOCUS_START = 100           
 
-# Камера установлена вверх ногами -> переворачиваем каждый кадр сразу после захвата,
-# до того как он попадет в current_live_frame, на предпросмотр и на снимки.
 ROTATE_180 = True
-
 pcb_dir = "pcb_pic"
 
 def open_camera():
@@ -33,7 +31,10 @@ def load_calibration(path: str):
     with np.load(path) as d:
         return d["mtx"], d["dist"]
 
-def CameraInit():
+def CameraInit(headless: bool = False):
+    """
+    :param headless: Если True, GUI-окна OpenCV выключаются (режим работы без монитора).
+    """
     cap = open_camera()
     aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -49,54 +50,67 @@ def CameraInit():
         except Exception as e:
             print(f"Калибровка не загружена ({e}) — без коррекции дисторсии.")
 
-    print(f"Захват: {aw}x{ah} @ {cap.get(cv2.CAP_PROP_FPS):.0f} fps")
-    print("q выход | a/d фокус | f автофокус | u дисторсия | p поиск меток | s снимок")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Захват: {aw}x{ah} @ {fps:.0f} fps (Headless: {headless})")
 
     win = "IMX577"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, DISPLAY_WIDTH, disp_h)
+    # Инициализируем окно только если есть монитор/GUI
+    if not headless:
+        print("q выход | a/d фокус | f автофокус | u дисторсия | p поиск меток | s снимок")
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, DISPLAY_WIDTH, disp_h)
 
     focus, autofocus = FOCUS_START, False
     undist, process = maps is not None, False
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Ошибка: нет кадра.")
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Ошибка: нет кадра.")
+                break
 
-        if ROTATE_180:
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
+            if ROTATE_180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-        global current_live_frame
-        current_live_frame = frame.copy()
+            global current_live_frame
+            current_live_frame = frame.copy()
 
-        if undist and maps is not None:          
-            frame = cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
+            if undist and maps is not None:          
+                frame = cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
 
-        disp = cv2.resize(frame, (DISPLAY_WIDTH, disp_h), interpolation=cv2.INTER_AREA)
-        cv2.imshow(win, disp)
+            # Отрисовка и обработка клавиатуры только при наличии GUI
+            if not headless:
+                disp = cv2.resize(frame, (DISPLAY_WIDTH, disp_h), interpolation=cv2.INTER_AREA)
+                cv2.imshow(win, disp)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("f"):
-            autofocus = not autofocus
-            cap.set(cv2.CAP_PROP_AUTOFOCUS, int(autofocus))
-            if not autofocus:
-                cap.set(cv2.CAP_PROP_FOCUS, focus)
-        elif key in (ord("d"), ord("a")) and not autofocus:
-            focus = min(255, focus + 5) if key == ord("d") else max(0, focus - 5)
-            cap.set(cv2.CAP_PROP_FOCUS, focus)
-        elif key == ord("u") and maps is not None:
-            undist = not undist
-        elif key == ord("p"):
-            process = not process
-        elif key == ord("s"):
-            take_snapshot(frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("f"):
+                    autofocus = not autofocus
+                    cap.set(cv2.CAP_PROP_AUTOFOCUS, int(autofocus))
+                    if not autofocus:
+                        cap.set(cv2.CAP_PROP_FOCUS, focus)
+                elif key in (ord("d"), ord("a")) and not autofocus:
+                    focus = min(255, focus + 5) if key == ord("d") else max(0, focus - 5)
+                    cap.set(cv2.CAP_PROP_FOCUS, focus)
+                elif key == ord("u") and maps is not None:
+                    undist = not undist
+                elif key == ord("p"):
+                    process = not process
+                elif key == ord("s"):
+                    take_snapshot(frame)
+            else:
+                # В headless-режиме предотвращаем 100% загрузку CPU паузкой
+                time.sleep(0.01)
 
-    cap.release()
-    cv2.destroyAllWindows()
+    except KeyboardInterrupt:
+        print("\nОстановка по Ctrl+C")
+    finally:
+        cap.release()
+        if not headless:
+            cv2.destroyAllWindows()
 
 def take_snapshot(frame):
     counter = 1
@@ -115,4 +129,7 @@ def take_snapshot(frame):
     print(f"Снимок сохранен: {full_path}")
 
 if __name__ == "__main__":
-    CameraInit()
+    # Для работы без монитора передайте headless=True
+    # Или автоматически проверьте DISPLAY переменное окружение:
+    is_headless = os.environ.get("DISPLAY") is None
+    CameraInit(headless=is_headless)
